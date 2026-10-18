@@ -9,7 +9,7 @@ MSKU4471290 (BoL BOL-CC-20261009-0001):
 
 The reefer logged a +2.0 degC excursion (-16.0 vs the -18.0 limit). Carrier and
 Customs both recorded it; the AIS mirror's sensor sample missed the spike and
-reports a clean -17.5. 2-of-3 therefore settles BUCKET_2_MINOR_THERMAL_DRIFT
+reports a clean -18.5. 2-of-3 therefore settles BUCKET_2_MINOR_THERMAL_DRIFT
 with source_count == 2, which is exactly the dissent the quorum must survive.
 """
 
@@ -32,7 +32,7 @@ MANIFEST = "CargoClear mock customs manifest | LC-1 | MSKU4471290 | 18t shrimp |
 CARGO_SPEC_HASH = hashlib.sha256(CARGO_SPEC.encode()).hexdigest()
 MANIFEST_HASH = hashlib.sha256(MANIFEST.encode()).hexdigest()
 
-PEAKS = {"a": -160, "b": -160, "c": -175}
+PEAKS = {"a": -160, "b": -160, "c": -185}
 
 
 def feed(peak: int) -> dict:
