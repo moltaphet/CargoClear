@@ -1,0 +1,255 @@
+{
+  "ctor": {
+    "kwparams": {},
+    "params": [
+      [
+        "carrier_authority_pubkey",
+        "string"
+      ]
+    ]
+  },
+  "methods": {
+    "accept_lc_terms": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "cancel_unaccepted_lc": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "check_bol_attestation": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ],
+        [
+          "bol_record_id",
+          "string"
+        ],
+        [
+          "attestation_signature",
+          "string"
+        ]
+      ],
+      "readonly": true,
+      "ret": "bool"
+    },
+    "claim_funds": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "get_bol_message": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ],
+        [
+          "bol_record_id",
+          "string"
+        ]
+      ],
+      "readonly": true,
+      "ret": "string"
+    },
+    "get_feed_sources": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "readonly": true,
+      "ret": "dict"
+    },
+    "get_lc_state": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "readonly": true,
+      "ret": "dict"
+    },
+    "get_protocol_summary": {
+      "kwparams": {},
+      "params": [],
+      "readonly": true,
+      "ret": "dict"
+    },
+    "open_letter_of_credit": {
+      "kwparams": {},
+      "params": [
+        [
+          "exporter",
+          "string"
+        ],
+        [
+          "container_id",
+          "string"
+        ],
+        [
+          "cargo_spec_hash",
+          "string"
+        ],
+        [
+          "max_temp_tenths_c",
+          "int"
+        ],
+        [
+          "latest_arrival_ts",
+          "int"
+        ],
+        [
+          "feed_a_url",
+          "string"
+        ],
+        [
+          "feed_b_url",
+          "string"
+        ],
+        [
+          "feed_c_url",
+          "string"
+        ]
+      ],
+      "payable": true,
+      "readonly": false,
+      "ret": "string"
+    },
+    "preview_bucket": {
+      "kwparams": {},
+      "params": [
+        [
+          "max_temp",
+          "int"
+        ],
+        [
+          "peak_temp",
+          "int"
+        ],
+        [
+          "arrival_ts",
+          "int"
+        ],
+        [
+          "latest_arrival_ts",
+          "int"
+        ]
+      ],
+      "readonly": true,
+      "ret": "int"
+    },
+    "preview_settlement": {
+      "kwparams": {},
+      "params": [
+        [
+          "principal",
+          "int"
+        ],
+        [
+          "bucket",
+          "int"
+        ]
+      ],
+      "readonly": true,
+      "ret": "dict"
+    },
+    "reclaim_expired_lc": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "reject_lc_terms": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "settle_shipment_stage": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ],
+        [
+          "stage",
+          "int"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "verify_bill_of_lading": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ],
+        [
+          "bol_record_id",
+          "string"
+        ],
+        [
+          "attestation_signature",
+          "string"
+        ]
+      ],
+      "payable": false,
+      "readonly": false,
+      "ret": "string"
+    },
+    "verify_solvency_invariant": {
+      "kwparams": {},
+      "params": [],
+      "readonly": true,
+      "ret": "dict"
+    }
+  }
+}
