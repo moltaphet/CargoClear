@@ -516,21 +516,31 @@ def run_validator(leader_payload, own_payload) -> bool:
     return True
 
 
+def _field(res, name: str):
+    """Reads `name` from a response object or mapping; None when absent."""
+    if isinstance(res, dict):
+        return res.get(name)
+    return getattr(res, name, None)
+
+
 def fetch_source(url: str) -> tuple:
-    """(kind, record_or_None). 404 -> LAG; every other failure -> OUT."""
+    """(kind, record_or_None). 404 -> LAG; every other failure -- including a
+    missing/malformed response or status -- -> OUT. Never raises."""
     try:
         res = gl.nondet.web.get(url)
     except Exception:
         return (SRC_OUTAGE, None)
-    status = res.status
+    status = _field(res, "status")
     if status == 404:
         return (SRC_LAG, None)
-    if not _is_int(status) or status < 200 or status >= 300:
+    if not isinstance(status, int) or isinstance(status, bool) or status < 200 or status >= 300:
         return (SRC_OUTAGE, None)
-    body = res.body
-    if body is None or len(body) == 0 or len(body) > MAX_FEED_BODY:
+    body = _field(res, "body")
+    if body is None:
         return (SRC_OUTAGE, None)
     try:
+        if len(body) == 0 or len(body) > MAX_FEED_BODY:
+            return (SRC_OUTAGE, None)
         text = bytes(body).decode("utf-8")
     except Exception:
         return (SRC_OUTAGE, None)
@@ -638,6 +648,9 @@ class CargoClear(gl.contract.Contract):
     bol_registry: TreeMap[str, str]
     total_deposited: u256
     total_withdrawn: u256
+    # O(1) summary counters, maintained on every transition (appended last).
+    state_counts: TreeMap[str, u256]
+    total_unreleased: u256
 
     def __init__(self, carrier_authority_pubkey: str):
         raw = _unhex(carrier_authority_pubkey, 32)
@@ -651,6 +664,7 @@ class CargoClear(gl.contract.Contract):
         self.lc_count = 0
         self.total_deposited = 0
         self.total_withdrawn = 0
+        self.total_unreleased = 0
 
     # ------------------------------------------------------------------ utils
     def _lc(self, lc_id: str) -> LetterOfCredit:
@@ -677,8 +691,18 @@ class CargoClear(gl.contract.Contract):
         msg = self._bol_message(lc, bol_record_id).encode("utf-8")
         return ed25519_verify(pub, msg, sig)
 
+    def _set_state(self, lc: LetterOfCredit, new_state: str) -> None:
+        old = lc.state
+        if old in self.state_counts:
+            self.state_counts[old] = int(self.state_counts[old]) - 1
+        self.state_counts[new_state] = (
+            int(self.state_counts[new_state]) if new_state in self.state_counts else 0
+        ) + 1
+        lc.state = new_state
+
     def _credit_importer_all(self, lc: LetterOfCredit) -> None:
         amount = int(lc.unreleased)
+        self.total_unreleased = int(self.total_unreleased) - amount
         lc.importer_credited = int(lc.importer_credited) + amount
         lc.unreleased = 0
 
@@ -733,12 +757,13 @@ class CargoClear(gl.contract.Contract):
 
     @gl.public.view
     def get_protocol_summary(self) -> dict:
+        # O(1): served from counters kept in step with every transition. Only
+        # verify_solvency_invariant (the from-scratch audit) scans all L/Cs.
         counts = {}
-        unreleased = 0
-        for i in range(int(self.lc_count)):
-            lc = self.lcs["LC-" + str(i + 1)]
-            counts[lc.state] = counts.get(lc.state, 0) + 1
-            unreleased += int(lc.unreleased)
+        for name in OPEN_STATES + (ST_COMPLETED, ST_REJECTED, ST_CANCELLED, ST_EXPIRED, ST_ABORTED):
+            if name in self.state_counts and int(self.state_counts[name]) > 0:
+                counts[name] = int(self.state_counts[name])
+        unreleased = int(self.total_unreleased)
         return {
             "protocol": "CargoClear",
             "carrier_authority_pubkey": self.carrier_authority_pubkey,
@@ -915,6 +940,10 @@ class CargoClear(gl.contract.Contract):
             quorum_failures=0,
         )
         self.lc_count = n
+        self.state_counts[ST_PENDING] = (
+            int(self.state_counts[ST_PENDING]) if ST_PENDING in self.state_counts else 0
+        ) + 1
+        self.total_unreleased = int(self.total_unreleased) + principal
         self.total_deposited = int(self.total_deposited) + principal
         return lc_id
 
@@ -928,7 +957,7 @@ class CargoClear(gl.contract.Contract):
             raise _err(ERR_STATE, "L/C is not pending acceptance")
         if _now_ts() > int(lc.accept_deadline):
             raise _err(ERR_EXPIRED, "48h acceptance window closed")
-        lc.state = ST_ACTIVE
+        self._set_state(lc, ST_ACTIVE)
         return ST_ACTIVE
 
     @gl.public.write
@@ -938,7 +967,7 @@ class CargoClear(gl.contract.Contract):
             raise _err(ERR_UNAUTHORIZED, "only the exporter may reject")
         if lc.state != ST_PENDING:
             raise _err(ERR_STATE, "L/C is not pending acceptance")
-        lc.state = ST_REJECTED
+        self._set_state(lc, ST_REJECTED)
         return ST_REJECTED
 
     @gl.public.write
@@ -956,7 +985,7 @@ class CargoClear(gl.contract.Contract):
         else:
             raise _err(ERR_STATE, "L/C is not unaccepted")
         self._credit_importer_all(lc)
-        lc.state = ST_CANCELLED
+        self._set_state(lc, ST_CANCELLED)
         return ST_CANCELLED
 
     # ------------------------------------------ Ed25519 eB/L attestation
@@ -1037,7 +1066,7 @@ class CargoClear(gl.contract.Contract):
                 # Voyage aborted before the departure tranche was ever released:
                 # the importer is made whole with everything still in escrow.
                 self._credit_importer_all(lc)
-                lc.state = ST_ABORTED
+                self._set_state(lc, ST_ABORTED)
                 lc.stage1_manifest_hash = payload["manifest_hash"]
                 lc.stage1_sources = payload["source_count"]
                 lc.stage1_event_ts = payload["event_ts"]
@@ -1046,7 +1075,8 @@ class CargoClear(gl.contract.Contract):
             lc.exporter_credited = int(lc.exporter_credited) + amount
             lc.unreleased = int(lc.unreleased) - amount
             lc.stage1_settled = True
-            lc.state = ST_STAGE_1
+            self.total_unreleased = int(self.total_unreleased) - amount
+            self._set_state(lc, ST_STAGE_1)
             lc.stage1_manifest_hash = payload["manifest_hash"]
             lc.stage1_sources = payload["source_count"]
             lc.stage1_event_ts = payload["event_ts"]
@@ -1056,9 +1086,10 @@ class CargoClear(gl.contract.Contract):
         lc.exporter_credited = int(lc.exporter_credited) + exporter
         lc.importer_credited = int(lc.importer_credited) + importer
         lc.unreleased = int(lc.unreleased) - exporter - importer
+        self.total_unreleased = int(self.total_unreleased) - exporter - importer
         lc.stage2_settled = True
         lc.final_bucket = bucket
-        lc.state = ST_COMPLETED
+        self._set_state(lc, ST_COMPLETED)
         lc.stage2_manifest_hash = payload["manifest_hash"]
         lc.stage2_sources = payload["source_count"]
         lc.stage2_event_ts = payload["event_ts"]
@@ -1077,7 +1108,7 @@ class CargoClear(gl.contract.Contract):
         if _now_ts() <= cutoff:
             raise _err(ERR_NOT_YET, "settlement window still open")
         self._credit_importer_all(lc)
-        lc.state = ST_EXPIRED
+        self._set_state(lc, ST_EXPIRED)
         return ST_EXPIRED
 
     # ------------------------------------------------------------- payouts

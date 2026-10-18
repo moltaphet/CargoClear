@@ -1062,5 +1062,12 @@
     "The forged-BoL transaction is a well-formed Ed25519 signature by a different key over the correct canonical message.",
     "claim_funds txs finalize and record the emitted transfer in `emitted_messages`; Studio Next did not credit the recipient EOAs in ~10 minutes of observation (a minimal emit_transfer test contract behaved identically), so balances_after_wei does not show the payout.",
     "Feed commit 550cb98 (first push) was superseded by 41ae873 which fixed the AIS mirror sample; only 41ae873 is pinned by this deployment."
-  ]
+  ],
+  "tests_after_polish": {
+    "command": "python -m pytest tests/ -v",
+    "result": "2139 passed in 479.84s",
+    "direct_mode_tests": 2085,
+    "mutation_runs": 54,
+    "note": "Contract on main was hardened after this deployment (safe fetch_source, O(1) get_protocol_summary) and not redeployed; the deployed address runs source_sha256 above (git show 329d90a:contracts/cargo_clear.py)."
+  }
 }

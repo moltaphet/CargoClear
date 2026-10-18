@@ -782,6 +782,138 @@ def test_contract_exposes_exactly_the_documented_surface():
         assert not any(forbidden in n for n in methods), forbidden
 
 
+# ================================================== safe fetch / O(1) summary
+class _Resp:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+GOOD_BODY = json.dumps(record(manifest_hash=H)).encode()
+
+
+@pytest.mark.parametrize(
+    "name,resp,kind",
+    [
+        ("no_status_attr", _Resp(body=GOOD_BODY), "OUT"),
+        ("status_none", _Resp(status=None, body=GOOD_BODY), "OUT"),
+        ("status_str", _Resp(status="200", body=GOOD_BODY), "OUT"),
+        ("status_bool", _Resp(status=True, body=GOOD_BODY), "OUT"),
+        ("status_float", _Resp(status=200.0, body=GOOD_BODY), "OUT"),
+        ("no_body_attr", _Resp(status=200), "OUT"),
+        ("body_none", _Resp(status=200, body=None), "OUT"),
+        ("body_empty", _Resp(status=200, body=b""), "OUT"),
+        ("body_int", _Resp(status=200, body=5), "OUT"),
+        ("body_bad_utf8", _Resp(status=200, body=b"\xff\xfe"), "OUT"),
+        ("plain_object", object(), "OUT"),
+        ("none_response", None, "OUT"),
+        ("dict_without_status", {"body": GOOD_BODY}, "OUT"),
+        ("dict_404", {"status": 404, "body": b""}, "LAG"),
+        ("obj_404", _Resp(status=404), "LAG"),
+        ("obj_ok", _Resp(status=200, body=GOOD_BODY), "POS"),
+        ("dict_ok", {"status": 200, "body": GOOD_BODY}, "POS"),
+        ("bytearray_ok", _Resp(status=200, body=bytearray(GOOD_BODY)), "POS"),
+    ],
+)
+def test_fetch_source_never_raises_on_odd_responses(world, cc, monkeypatch, name, resp, kind):
+    monkeypatch.setattr(cc.gl.nondet.web, "get", lambda url, **kw: resp)
+    got, _ = cc.fetch_source("https://example.invalid/x.json")
+    assert got == kind
+
+
+def test_fetch_source_treats_a_raising_fetch_as_outage(world, cc, monkeypatch):
+    def boom(url, **kw):
+        raise RuntimeError("rpc outlier")
+
+    monkeypatch.setattr(cc.gl.nondet.web, "get", boom)
+    assert cc.fetch_source("https://example.invalid/x.json")[0] == "OUT"
+
+
+def test_malformed_response_cannot_revert_settlement(world, monkeypatch, cc):
+    """A broken fetch is an outage that cannot vote: settlement returns a retryable
+    QUORUM_FAILURE instead of reverting the transaction."""
+    world.ready()
+    monkeypatch.setattr(cc.gl.nondet.web, "get", lambda url, **kw: _Resp(body=GOOD_BODY))
+    out = world.settle(1)
+    assert out["verdict"] == 2 and out["source_count"] == 0
+    assert world.state()["stage1_settled"] is False
+
+
+def _recount(world, n):
+    counts, unreleased = {}, 0
+    for i in range(1, n + 1):
+        st = world.state(f"LC-{i}")
+        counts[st["state"]] = counts.get(st["state"], 0) + 1
+        unreleased += st["unreleased_escrow"]
+    return counts, unreleased
+
+
+def _assert_summary_consistent(world, n):
+    s = world.contract.get_protocol_summary()
+    counts, unreleased = _recount(world, n)
+    assert s["lc_state_counts"] == counts
+    assert s["unreleased_escrow"] == unreleased
+    assert s["lc_count"] == n
+    assert world.contract.verify_solvency_invariant()["unreleased_escrow"] == unreleased
+
+
+def test_summary_counters_track_every_transition(world):
+    world.open(principal=PRINCIPAL)  # LC-1 -> completed
+    world.open(principal=5_000)  # LC-2 -> rejected + cancelled
+    world.open(principal=7_001)  # LC-3 -> unaccepted + cancelled after 48h
+    world.open(principal=9_999)  # LC-4 -> accepted, expires
+    world.open(principal=3_333)  # LC-5 -> stays pending
+    world.open(principal=8_888)  # LC-6 -> aborted before departure
+    _assert_summary_consistent(world, 6)
+    world.accept("LC-1")
+    world.verify_bol("LC-1", BOL)
+    _stage1(world)
+    _assert_summary_consistent(world, 6)
+    _stage2(world)
+    _assert_summary_consistent(world, 6)
+    world.as_(world.exporter)
+    world.contract.reject_lc_terms("LC-2")
+    _assert_summary_consistent(world, 6)
+    world.as_(world.importer)
+    world.contract.cancel_unaccepted_lc("LC-2")
+    _assert_summary_consistent(world, 6)
+    world.as_(world.exporter)
+    world.contract.accept_lc_terms("LC-4")
+    world.contract.accept_lc_terms("LC-6")
+    world.verify_bol("LC-6", "BOL-6")
+    ab = ok(record(manifest_hash=H, status="VOYAGE_ABORTED", bol_record_id="BOL-6", lc_id="LC-6"))
+    world.mock_feeds(ab, ab, ab)
+    world.as_(world.importer)
+    assert json.loads(world.contract.settle_shipment_stage("LC-6", 1))["verdict"] == 0
+    _assert_summary_consistent(world, 6)
+    world.warp(ACCEPT_DEADLINE + 1)
+    world.as_(world.importer)
+    world.contract.cancel_unaccepted_lc("LC-3")
+    _assert_summary_consistent(world, 6)
+    world.warp(LATEST + GRACE + SETTLEMENT_WINDOW + 1)
+    world.as_(world.importer)
+    world.contract.reclaim_expired_lc("LC-4")
+    _assert_summary_consistent(world, 6)
+    s = world.contract.get_protocol_summary()
+    assert s["lc_state_counts"] == {
+        "COMPLETED": 1, "CANCELLED": 2, "EXPIRED_REFUNDED": 1, "PENDING_EXPORTER_ACCEPTANCE": 1,
+        "ABORTED_REFUNDED": 1,
+    }
+    assert s["unreleased_escrow"] == 3_333
+
+
+def test_summary_does_not_scan_the_letters(world):
+    """get_protocol_summary must stay O(1): it reads counters, never the LC map."""
+    import ast
+
+    src = Path(CONTRACT).read_text()
+    fn = next(
+        n for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "get_protocol_summary"
+    )
+    assert not any(isinstance(n, (ast.For, ast.While, ast.ListComp)) and "lcs" in ast.unparse(n) for n in ast.walk(fn))
+    assert "self.lcs" not in ast.unparse(fn)
+
+
 # ====================================================== mutation analysis
 MUTATIONS = [
     # --- money math
@@ -837,6 +969,11 @@ MUTATIONS = [
     ("reclaim_cutoff_off_by_one", "        if _now_ts() <= cutoff:", "        if _now_ts() < cutoff:"),
     ("reclaim_ignores_state", "        if lc.state != ST_ACTIVE and lc.state != ST_STAGE_1:\n            raise _err(ERR_STATE, \"L/C is not open\")", "        if False:\n            raise _err(ERR_STATE, \"L/C is not open\")"),
     ("quorum_failure_applies_state", "            lc.quorum_failures = int(lc.quorum_failures) + 1\n            return json.dumps(payload, sort_keys=True)", "            lc.quorum_failures = int(lc.quorum_failures) + 1\n            self._apply_settlement(lc, stage, payload)\n            return json.dumps(payload, sort_keys=True)"),
+    ("summary_unreleased_not_reduced", "        amount = int(lc.unreleased)\n        self.total_unreleased = int(self.total_unreleased) - amount", "        amount = int(lc.unreleased)"),
+    ("summary_state_never_leaves_old", "            self.state_counts[old] = int(self.state_counts[old]) - 1\n", "            pass\n"),
+    ("summary_stage1_not_reduced", "            self.total_unreleased = int(self.total_unreleased) - amount\n            self._set_state(lc, ST_STAGE_1)", "            self._set_state(lc, ST_STAGE_1)"),
+    ("summary_stage2_not_reduced", "        self.total_unreleased = int(self.total_unreleased) - exporter - importer\n", ""),
+    ("fetch_status_unchecked", "    if not isinstance(status, int) or isinstance(status, bool) or status < 200 or status >= 300:", "    if status is None or status < 200 or status >= 300:"),
     ("solvency_check_disabled", "            and balance >= owed\n", "            and True\n"),
 ]
 

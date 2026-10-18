@@ -10,12 +10,12 @@ demurrage haircuts, and every wei is accounted for.
 | | |
 |---|---|
 | **Network** | GenLayer Studio Next, chain `61997` (`https://studio-next.genlayer.com/api`) |
-| **Contract** | [`0x985a9931Cd8BD8c0fd6cA37274D57e8f4235f34C`](https://explorer-studio-next.genlayer.com/address/0x985a9931Cd8BD8c0fd6cA37274D57e8f4235f34C) |
-| **Source SHA-256** | `2eab01f7a0c19a03bd58a48cc8b11355c10a3d31e9238bf5877f6d597afa6bd5` (`contracts/cargo_clear.py`; the code returned by `genlayer code` is byte-identical) |
+| **Contract** | [`0x985a9931Cd8BD8c0fd6cA37274D57e8f4235f34C`](https://explorer-studio-next.genlayer.com/address/0x985a9931Cd8BD8c0fd6cA37274D57e8f4235f34C) — deployed from the source at commit `329d90a`; the robustness polish on `main` (safe `fetch_source`, O(1) summary) has **not** been redeployed |
+| **Deployed source SHA-256** | `2eab01f7a0c19a03bd58a48cc8b11355c10a3d31e9238bf5877f6d597afa6bd5` (byte-identical to what `genlayer code` returns for the address; see `git show 329d90a:contracts/cargo_clear.py`) |
 | **Runner** | `py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng` (GenVM v0.3.0-rc7 line) |
 | **Feed commit (immutable pin)** | `41ae8738942b8e938036325e78b600ff6ec0df51` |
 | **Linter** | `genvm-lint check` and `genvm-lint typecheck`: 0 errors, 0 warnings |
-| **Tests** | 2112 pytest tests (2063 direct-mode + 49 mutation runs), all passing |
+| **Tests** | 2139 pytest tests (2085 direct-mode + 54 mutation runs), all passing |
 | **Authoritative record** | [`deployments/studio-next.json`](deployments/studio-next.json) |
 
 ## Design
@@ -111,7 +111,45 @@ verify_solvency_invariant()  solvent true, per_lc_conserved true  (before claims
                              exporter 30000000000000001 + importer 20000000000000002 == deposit)
 ```
 
-### Known limitation observed on Studio Next (not a contract fault)
+## Trust Model, Demo Scope & Known Limitations
+
+**Trust model.** Funds move only on (a) a valid Ed25519 attestation by the Carrier Authority key
+fixed at deployment and (b) a 2-of-3 agreement between three feed operators. Anyone who controls
+the Carrier key can attest any Bill of Lading, and any two colluding feed operators can decide a
+bucket. CargoClear minimises trust; it does not remove it.
+
+* **Local demo keys & CDN fixtures.** In this testnet demonstration the Carrier Authority
+  Ed25519 key is generated locally in `.secrets/carrier_ed25519.seed` (git-ignored) by the same
+  operator who runs the importer and exporter wallets, and the three "independent" feeds are
+  static fixtures that live in this single repository, pinned by commit SHA and served through
+  three CDNs. The CDNs are independent hosts; the *publisher* is not. A production deployment needs
+  a real accredited authority key and feeds published by genuinely separate parties.
+* **Immutable constructor authority.** `carrier_authority_pubkey` is set in the constructor and
+  there is no setter, rotation or admin path. Replacing or revoking the authority means deploying
+  a new contract; open letters of credit on the old contract keep their original authority.
+* **Post-grace exporter reclaim risk.** If the feeds stay unreachable (or never reach quorum),
+  nothing is settled and the importer may call `reclaim_expired_lc` once
+  `latest_arrival_ts + 7 days (grace) + 30 days (settlement window)` — 37 days after the
+  contractual arrival time — has passed. It returns everything still in escrow to the importer, so
+  an exporter whose cargo arrived but whose feeds are down for that long loses the unsettled
+  tranches. Exporters should watch their feeds and settle well inside the window. Funds already
+  released by Stage 1 stay with the exporter.
+* **Importer feed selection.** The importer chooses the three feed URLs when opening the L/C. The
+  contract constrains them (three fixed operator hosts, this repository, one shared 40-hex commit
+  SHA, `deployments/mock_feeds/{a,b,c}/`), but the *content* at that commit is the importer's
+  choice. **Exporters must inspect the pinned commit SHA and the three files (`get_feed_sources`)
+  during the 48-hour acceptance handshake**, and should reject the L/C if they do not accept what
+  those files say.
+* **Read cost.** `get_protocol_summary` is O(1): it is served from counters (`state_counts`,
+  `total_unreleased`) updated on every transition, so it does not grow with the number of
+  letters of credit. `verify_solvency_invariant` is deliberately an independent from-scratch
+  audit and therefore scales **linearly** with the number of L/Cs; call it sparingly on a
+  protocol with very many letters.
+* **Malformed fetches are outages.** `fetch_source` reads status/body defensively (object or
+  mapping, missing attribute, wrong type): anything unexpected is an `OUTAGE` that cannot vote, so
+  an RPC outlier yields a retryable `QUORUM_FAILURE` instead of reverting the transaction.
+
+### Payouts on Studio Next (observed, not a contract fault)
 
 `claim_funds` debits the ledger and emits the payout with `emit_transfer(..., on="finalized")`.
 The transactions finalize and the emitted message (correct recipient and amount) is recorded in
@@ -141,7 +179,7 @@ tests/                            test_ed25519_bol, test_aggregate_quorum,
 ```bash
 uv venv --python 3.12 && uv pip install --prerelease=allow -r requirements-dev.txt
 export GENVM_VERSION=v0.6.0-rc7      # the bundle that ships runner 5jycge…; tests set it by default
-.venv/bin/python -m pytest -q        # 2112 tests; add -m "not mutation" to skip the ~5 min mutation run
+.venv/bin/python -m pytest -q        # 2139 tests; add -m "not mutation" to skip the ~5 min mutation run
 .venv/bin/genvm-lint check contracts/cargo_clear.py
 .venv/bin/genvm-lint typecheck contracts/cargo_clear.py
 python scripts/verify_feeds.py 41ae8738942b8e938036325e78b600ff6ec0df51
@@ -164,9 +202,9 @@ Direct-mode tests must not be run with `pytest -s` (the SDK reads the message fr
   exact BPS; conservation for 60+ principals × 4 buckets; dust direction; payouts drain exactly
   what is owed; AST proof of no floats / no `/` / no `float`; views survive calldata round-trip.
 * **`test_contract_flows.py`** — full lifecycle, 48 h boundaries, 34 feed-pinning attacks,
-  authorization, replay, expiry, double claims, failed-transfer rollback, and **49 mutants**
+  authorization, replay, expiry, double claims, failed-transfer rollback, and **54 mutants**
   (changed constants, flipped comparisons, deleted checks, removed signature verification…) that
-  the suite must kill; all 49 are killed.
+  the suite must kill; all 54 are killed.
 
 Test-environment note: GenVM's direct-mode harness does not re-inject the transaction datetime
 after load, so tests move the clock by updating both the VM and `genlayer.message.raw["datetime"]`.
