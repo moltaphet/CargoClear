@@ -5,6 +5,18 @@
       [
         "carrier_authority_pubkey",
         "string"
+      ],
+      [
+        "manifest_witness_pubkey",
+        "string"
+      ],
+      [
+        "customs_witness_pubkey",
+        "string"
+      ],
+      [
+        "telemetry_witness_pubkey",
+        "string"
       ]
     ]
   },
@@ -52,6 +64,25 @@
       "readonly": true,
       "ret": "bool"
     },
+    "check_evidence": {
+      "kwparams": {},
+      "params": [
+        [
+          "lc_id",
+          "string"
+        ],
+        [
+          "slot",
+          "int"
+        ],
+        [
+          "record_json",
+          "string"
+        ]
+      ],
+      "readonly": true,
+      "ret": "dict"
+    },
     "claim_funds": {
       "kwparams": {},
       "params": [
@@ -79,7 +110,26 @@
       "readonly": true,
       "ret": "string"
     },
-    "get_feed_sources": {
+    "get_evidence_binding": {
+      "kwparams": {},
+      "params": [
+        [
+          "bol_record_id",
+          "string"
+        ],
+        [
+          "container_id",
+          "string"
+        ],
+        [
+          "vessel_imo",
+          "string"
+        ]
+      ],
+      "readonly": true,
+      "ret": "string"
+    },
+    "get_evidence_sources": {
       "kwparams": {},
       "params": [
         [
@@ -116,6 +166,10 @@
         ],
         [
           "container_id",
+          "string"
+        ],
+        [
+          "vessel_imo",
           "string"
         ],
         [

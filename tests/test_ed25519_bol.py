@@ -12,6 +12,7 @@ from conftest import (
     BOL,
     CARGO_HASH,
     CONTAINER,
+    IMO,
     LATEST,
     MAX_TEMP,
     PRINCIPAL,
@@ -248,17 +249,20 @@ def test_unhex_rejects_non_strings(cc):
 
 
 # ------------------------------------------------------ constructor key checks
-def _deploy_with(direct_vm, direct_deploy, key):
-    from conftest import CONTRACT
+def _deploy_with(direct_vm, direct_deploy, key, *witness_keys):
+    from conftest import CONTRACT, WITNESSES
     from gltest.direct.loader import create_address
 
     direct_vm.sender = create_address("deployer")
-    return direct_deploy(str(CONTRACT), key)
+    witness_keys = witness_keys or tuple(w.pub_hex for w in WITNESSES)
+    return direct_deploy(str(CONTRACT), key, *witness_keys)
 
 
-def test_constructor_accepts_real_key(direct_vm, direct_deploy, carrier):
+def test_constructor_accepts_real_keys(direct_vm, direct_deploy, carrier, witnesses):
     c = _deploy_with(direct_vm, direct_deploy, carrier.pub_hex)
-    assert c.get_protocol_summary()["carrier_authority_pubkey"] == carrier.pub_hex
+    summary = c.get_protocol_summary()
+    assert summary["carrier_authority_pubkey"] == carrier.pub_hex
+    assert summary["witness_pubkeys"] == [w.pub_hex for w in witnesses]
 
 
 @pytest.mark.parametrize(
@@ -279,6 +283,33 @@ def test_constructor_rejects_bad_keys(direct_vm, direct_deploy, key):
     assert_reverts("ERR_INVALID_CARRIER_PUBKEY", _deploy_with, direct_vm, direct_deploy, key)
 
 
+@pytest.mark.parametrize("slot", [0, 1, 2])
+@pytest.mark.parametrize(
+    "key",
+    ["", "00" * 31, "zz" * 32, "AB" * 32, "01" + "00" * 31, (P - 1).to_bytes(32, "little").hex(), (2).to_bytes(32, "little").hex()],
+)
+def test_constructor_rejects_bad_witness_keys(direct_vm, direct_deploy, carrier, witnesses, slot, key):
+    keys = [w.pub_hex for w in witnesses]
+    keys[slot] = key
+    assert_reverts("ERR_INVALID_WITNESS_PUBKEY", _deploy_with, direct_vm, direct_deploy, carrier.pub_hex, *keys)
+
+
+@pytest.mark.parametrize("pair", [(0, 1), (0, 2), (1, 2)])
+def test_constructor_rejects_two_witnesses_sharing_one_key(direct_vm, direct_deploy, carrier, witnesses, pair):
+    """Independent corroboration is meaningless if one key can fill two slots."""
+    keys = [w.pub_hex for w in witnesses]
+    keys[pair[1]] = keys[pair[0]]
+    assert_reverts("ERR_INVALID_WITNESS_PUBKEY", _deploy_with, direct_vm, direct_deploy, carrier.pub_hex, *keys)
+
+
+@pytest.mark.parametrize("slot", [0, 1, 2])
+def test_constructor_rejects_a_witness_that_is_the_carrier_authority(direct_vm, direct_deploy, carrier, witnesses, slot):
+    """The BoL signer must not also be able to sign settlement evidence."""
+    keys = [w.pub_hex for w in witnesses]
+    keys[slot] = carrier.pub_hex
+    assert_reverts("ERR_INVALID_WITNESS_PUBKEY", _deploy_with, direct_vm, direct_deploy, carrier.pub_hex, *keys)
+
+
 # =============================================================================
 # Bill of Lading attestation through the contract
 # =============================================================================
@@ -286,9 +317,9 @@ def test_canonical_message_layout(world):
     world.open()
     msg = world.contract.get_bol_message("LC-1", BOL)
     assert msg == "|".join(
-        [BOL, "LC-1", CONTAINER, hex_of(world.exporter), CARGO_HASH, str(MAX_TEMP), str(LATEST)]
+        [BOL, "LC-1", CONTAINER, IMO, hex_of(world.exporter), CARGO_HASH, str(MAX_TEMP), str(LATEST)]
     )
-    assert msg.count("|") == 6
+    assert msg.count("|") == 7
 
 
 def test_valid_attestation_check_view(world):
@@ -410,17 +441,18 @@ def test_signature_over_a_different_bol_id_is_rejected(world):
     assert_reverts("ERR_INVALID_BOL_ATTESTATION", world.contract.verify_bill_of_lading, "LC-1", BOL, sig)
 
 
-FIELDS = ["bol", "lc", "container", "exporter", "cargo", "temp", "latest"]
+FIELDS = ["bol", "lc", "container", "imo", "exporter", "cargo", "temp", "latest"]
 
 
 @pytest.mark.parametrize("field", FIELDS)
 def test_signature_over_any_altered_field_is_rejected(world, field):
-    """The carrier signs seven fields; changing any one of them breaks it."""
+    """The carrier signs eight fields; changing any one of them breaks it."""
     world.open()
     world.accept()
     parts = world.bol_message().split("|")
     idx = FIELDS.index(field)
     parts[idx] = parts[idx] + "x" if field in ("bol", "lc", "container") else {
+        "imo": "9321483",
         "exporter": hex_of(world.stranger),
         "cargo": hashlib.sha256(b"different cargo").hexdigest(),
         "temp": str(MAX_TEMP + 1),
@@ -431,7 +463,7 @@ def test_signature_over_any_altered_field_is_rejected(world, field):
     assert_reverts("ERR_INVALID_BOL_ATTESTATION", world.contract.verify_bill_of_lading, "LC-1", BOL, forged)
 
 
-@pytest.mark.parametrize("field", ["container", "cargo", "temp", "latest"])
+@pytest.mark.parametrize("field", ["container", "imo", "cargo", "temp", "latest"])
 def test_lc_terms_are_what_the_signature_binds(world, field):
     """Opening an L/C with terms that differ from what the carrier signed makes the
     carrier's signature useless: the contract rebuilds the message from L/C terms."""
@@ -440,6 +472,7 @@ def test_lc_terms_are_what_the_signature_binds(world, field):
     # a second L/C with one differing term cannot reuse a signature made for LC-1
     overrides = {
         "container": dict(container_id="MSKU7654321"),
+        "imo": dict(vessel_imo="9321483"),
         "cargo": dict(cargo_spec_hash=hashlib.sha256(b"x").hexdigest()),
         "temp": dict(max_temp_tenths_c=MAX_TEMP + 10),
         "latest": dict(latest_arrival_ts=LATEST + 99),

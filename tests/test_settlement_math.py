@@ -24,7 +24,6 @@ from conftest import (
 
 GRACE = 7 * 86400
 BPS = 10000
-H = "33" * 32
 
 
 # ------------------------------------------------- bucket boundary classification
@@ -217,11 +216,10 @@ def test_scenario_buckets_and_money(world, cc, scenario):
     now = 1_798_675_200
     world.ready(PRINCIPAL)
     world.warp(now)
-    dep = record(manifest_hash=H, status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0, event_ts=now - 5000, departure_ts=T0 - 6 * 86400)
+    dep = record(status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0, event_ts=now - 5000, departure_ts=T0 - 6 * 86400)
     world.mock_feeds(ok(dep), ok(dep), ok(dep))
     assert world.settle(1)["verdict"] == 1
     rec = record(
-        manifest_hash=H,
         status=status,
         peak_temp_tenths_c=MAX_TEMP + peak_off,
         arrival_ts=LATEST + arrival_off,
@@ -251,11 +249,11 @@ def test_payouts_drain_exactly_what_is_owed(world, cc, scenario, principal):
     now = 1_798_675_200
     world.ready(principal)
     world.warp(now)
-    dep = record(manifest_hash=H, status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0, event_ts=now - 5000, departure_ts=T0 - 6 * 86400)
+    dep = record(status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0, event_ts=now - 5000, departure_ts=T0 - 6 * 86400)
     world.mock_feeds(ok(dep), ok(dep), ok(dep))
     world.settle(1)
     rec = record(
-        manifest_hash=H, status=status, peak_temp_tenths_c=MAX_TEMP + peak_off,
+        status=status, peak_temp_tenths_c=MAX_TEMP + peak_off,
         arrival_ts=LATEST + arrival_off, departure_ts=T0 - 6 * 86400, event_ts=now - 50,
     )
     world.mock_feeds(ok(rec), ok(rec), ok(rec))
@@ -286,7 +284,7 @@ def test_payouts_drain_exactly_what_is_owed(world, cc, scenario, principal):
 
 def test_stage1_pays_exactly_twenty_percent_floor(world):
     world.ready(1003)
-    dep = record(manifest_hash=H, status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0)
+    dep = record(status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0)
     world.mock_feeds(ok(dep), ok(dep), ok(dep))
     world.settle(1)
     st = world.state()
@@ -350,7 +348,7 @@ def test_every_view_return_is_float_free(world):
     for call in (
         lambda: world.contract.get_lc_state("LC-1"),
         lambda: world.contract.get_protocol_summary(),
-        lambda: world.contract.get_feed_sources("LC-1"),
+        lambda: world.contract.get_evidence_sources("LC-1"),
         lambda: world.contract.verify_solvency_invariant(),
         lambda: world.contract.get_bol_message("LC-1", "BOL-X"),
         lambda: world.contract.preview_settlement(PRINCIPAL, 2),
@@ -368,7 +366,7 @@ def test_every_view_return_survives_calldata_roundtrip(world):
     for value in (
         world.contract.get_lc_state("LC-1"),
         world.contract.get_protocol_summary(),
-        world.contract.get_feed_sources("LC-1"),
+        world.contract.get_evidence_sources("LC-1"),
         world.contract.verify_solvency_invariant(),
     ):
         assert calldata.decode(calldata.encode(value)) == value
@@ -378,9 +376,9 @@ def test_settle_result_is_float_free_json(world):
     import json
 
     world.ready()
-    dep = record(manifest_hash=H, status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0)
+    dep = record(status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0)
     world.mock_feeds(ok(dep), ok(dep), ok(dep))
     world.as_(world.importer)
     raw = world.contract.settle_shipment_stage("LC-1", 1)
-    assert "." not in raw.replace(H, "")
+    assert "." not in raw
     _no_floats(json.loads(raw))

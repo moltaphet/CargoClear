@@ -30,6 +30,8 @@ ERR_STAGE = "ERR_INVALID_STAGE"
 ERR_TRANSFER = "ERR_TRANSFER_FAILED_RESTORED"
 ERR_FUNDS = "ERR_PRINCIPAL_REQUIRED"
 ERR_PUBKEY = "ERR_INVALID_CARRIER_PUBKEY"
+ERR_WITNESS_KEY = "ERR_INVALID_WITNESS_PUBKEY"
+ERR_IMO = "ERR_INVALID_VESSEL_IMO"
 
 # --- Settlement constants (integer basis points) -----------------------------
 BPS = 10000
@@ -49,7 +51,7 @@ THERMAL_TOLERANCE_TENTHS = 30  # 3.0 degC above the contractual maximum
 GRACE_SECONDS = 7 * 24 * 3600  # late-arrival demurrage window
 ACCEPTANCE_WINDOW = 48 * 3600  # exporter handshake
 SETTLEMENT_WINDOW = 30 * 24 * 3600  # after latest_arrival + grace, importer may reclaim
-FUTURE_SKEW = 3600  # feed timestamps beyond now + this are rejected
+FUTURE_SKEW = 3600  # evidence timestamps beyond now + this are rejected
 MIN_PRINCIPAL = 1000  # wei
 MIN_TEMP_TENTHS = -700
 MAX_TEMP_TENTHS = 500
@@ -84,30 +86,42 @@ FS_CLEARED = "CUSTOMS_CLEARED"
 FS_CUSTOMS_REJECTED = "CUSTOMS_REJECTED"
 FS_ABORTED = "VOYAGE_ABORTED"
 FEED_STATUSES = (FS_DEPARTED, FS_CLEARED, FS_CUSTOMS_REJECTED, FS_ABORTED)
-FEED_SCHEMA = "cargoclear.feed.v1"
-FEED_KEYS = (
+
+# --- Signed witness evidence ---------------------------------------------------
+# Every settlement source is an independent WITNESS that signs its own record
+# with its own Ed25519 key. The contract trusts a record because the signature
+# verifies against the witness key fixed at deployment -- never because of the
+# host it was fetched from. Integrity therefore comes from the keys; the three
+# distinct hosts only buy transport (liveness) diversity.
+EVIDENCE_SCHEMA = "cargoclear.evidence.v2"
+BINDING_DOMAIN = "cargoclear.binding.v2"
+DIGEST_DOMAIN = "cargoclear.corroboration.v2"
+EVIDENCE_KEYS = (
     "arrival_ts",
+    "binding",
     "bol_record_id",
     "container_id",
     "departure_ts",
     "event_ts",
-    "lc_id",
-    "manifest_hash",
     "peak_temp_tenths_c",
+    "role",
     "schema",
+    "signature",
     "status",
+    "vessel_imo",
 )
+WITNESS_ROLES = ("CARRIER_MANIFEST_WITNESS", "PORT_CUSTOMS_WITNESS", "COLD_CHAIN_AIS_WITNESS")
 
-# --- Pinned feed operators ----------------------------------------------------
-REPO_OWNER = "moltaphet"
-REPO_NAME = "CargoClear"
-FEED_HOSTS = ("raw.githubusercontent.com", "cdn.jsdelivr.net", "raw.githack.com")
-FEED_ROLES = ("CARRIER_MANIFEST_FEED", "PORT_CUSTOMS_FEED", "COLD_CHAIN_AIS_MIRROR")
-FEED_DIRS = ("a", "b", "c")
+# --- Evidence endpoints -------------------------------------------------------
+MAX_URL_LEN = 1024  # room for relays that carry the record in the URL path
+# Static git-hosting mirrors are one publisher behind several CDNs; they can not
+# be an independent witness endpoint, whoever signs the files.
+MIRROR_DOMAINS = ("githubusercontent.com", "jsdelivr.net", "githack.com", "github.io", "gitlab.io")
 
 _HEX = "0123456789abcdef"
 _ID_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
-_FILE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+_PATH_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-/"
+_HOST_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
 
 
 # =============================================================================
@@ -261,10 +275,58 @@ def _now_ts() -> int:
     return int(dt.timestamp())
 
 
+def valid_imo(imo) -> bool:
+    """IMO ship identification number: 7 digits whose weighted sum
+    (7,6,5,4,3,2 over the first six) ends in the seventh digit."""
+    if not isinstance(imo, str) or len(imo) != 7:
+        return False
+    for ch in imo:
+        if ch < "0" or ch > "9":
+            return False
+    total = 0
+    for i in range(6):
+        total += int(imo[i]) * (7 - i)
+    return total % 10 == int(imo[6])
+
+
+def evidence_binding(bol_record_id: str, container_id: str, vessel_imo: str) -> str:
+    """The shipment nonce every witness must sign: sha256 over the unique
+    Bill of Lading id, the container and the vessel IMO."""
+    text = "|".join((BINDING_DOMAIN, bol_record_id, container_id, vessel_imo))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def canonical_evidence_message(rec: dict) -> str:
+    """The exact string a witness signs. Every field is charset-restricted, so
+    '|' can not occur inside one."""
+    return "|".join(
+        (
+            EVIDENCE_SCHEMA,
+            rec["role"],
+            rec["binding"],
+            rec["bol_record_id"],
+            rec["container_id"],
+            rec["vessel_imo"],
+            rec["status"],
+            str(rec["departure_ts"]),
+            str(rec["arrival_ts"]),
+            str(rec["event_ts"]),
+            str(rec["peak_temp_tenths_c"]),
+        )
+    )
+
+
+def corroboration_digest(binding: str, stage: int, bucket: int, kind: str) -> str:
+    """What two or more witnesses independently agreed on, bound to the shipment."""
+    text = "|".join((DIGEST_DOMAIN, binding, str(stage), str(bucket), kind))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def canonical_bol_message(
     bol_record_id: str,
     lc_id: str,
     container_id: str,
+    vessel_imo: str,
     exporter_address: str,
     cargo_spec_hash: str,
     max_temp_tenths_c: int,
@@ -275,6 +337,7 @@ def canonical_bol_message(
             bol_record_id,
             lc_id,
             container_id,
+            vessel_imo,
             exporter_address,
             cargo_spec_hash,
             str(max_temp_tenths_c),
@@ -351,17 +414,19 @@ def parse_feed_json(text: str):
 
 def _record_ok(rec) -> bool:
     """Exact key set + exact types + sane ranges."""
-    if tuple(sorted(rec.keys())) != FEED_KEYS:
+    if tuple(sorted(rec.keys())) != EVIDENCE_KEYS:
         return False
-    if rec["schema"] != FEED_SCHEMA:
+    if rec["schema"] != EVIDENCE_SCHEMA:
         return False
-    if not _valid_id(rec["bol_record_id"]) or not _valid_id(rec["lc_id"]):
+    if rec["role"] not in WITNESS_ROLES:
         return False
-    if not _valid_id(rec["container_id"]):
+    if not _valid_id(rec["bol_record_id"]) or not _valid_id(rec["container_id"]):
+        return False
+    if not valid_imo(rec["vessel_imo"]):
         return False
     if rec["status"] not in FEED_STATUSES:
         return False
-    if _unhex(rec["manifest_hash"], 32) is None:
+    if _unhex(rec["binding"], 32) is None or _unhex(rec["signature"], 64) is None:
         return False
     for key in ("departure_ts", "arrival_ts", "event_ts", "peak_temp_tenths_c"):
         v = rec[key]
@@ -373,118 +438,140 @@ def _record_ok(rec) -> bool:
     return True
 
 
-def evaluate_record(rec, terms: dict, stage: int, now: int) -> dict:
-    """Judge ONE parsed feed record against the L/C terms for the requested
-    stage. Never raises. Returns {kind, stage, bucket, manifest_hash, event_ts}."""
-    bad = {"kind": SRC_OUTAGE, "stage": stage, "bucket": 0, "manifest_hash": "", "event_ts": 0}
+def _outcome(kind: str, stage: int, bucket: int = 0, event_ts: int = 0, signer: str = "", binding: str = "") -> dict:
+    return {
+        "kind": kind,
+        "stage": stage,
+        "bucket": bucket,
+        "event_ts": event_ts,
+        "signer": signer,
+        "binding": binding,
+    }
+
+
+def authenticate_record(rec, terms: dict, slot: int) -> bool:
+    """True only for an authentic record from witness slot `slot`:
+    (1) well-formed, (2) tagged with this slot's role, (3) carrying the shipment
+    binding derived from the verified BoL id, container and vessel IMO, and
+    (4) signed by this slot's Ed25519 witness key over every field it asserts.
+    Never raises."""
     if rec is None or not _record_ok(rec):
-        return bad
+        return False
+    if rec["role"] != WITNESS_ROLES[slot]:
+        return False
     if (
         rec["bol_record_id"] != terms["bol_record_id"]
-        or rec["lc_id"] != terms["lc_id"]
         or rec["container_id"] != terms["container_id"]
+        or rec["vessel_imo"] != terms["vessel_imo"]
+        or rec["binding"] != terms["binding"]
     ):
+        return False
+    witness_hex = terms["witness_pubkeys"][slot]
+    sig = bytes.fromhex(rec["signature"])
+    msg = canonical_evidence_message(rec).encode("utf-8")
+    return ed25519_verify(bytes.fromhex(witness_hex), msg, sig)
+
+
+def evaluate_record(rec, terms: dict, stage: int, now: int, slot: int) -> dict:
+    """Judge ONE parsed evidence record from witness slot `slot` against the L/C
+    terms for the requested stage. Never raises. Anything that fails
+    authenticate_record is an unauthenticated payload: OUTAGE, it can not vote."""
+    bad = _outcome(SRC_OUTAGE, stage)
+    if not authenticate_record(rec, terms, slot):
         return bad
+    witness_hex = terms["witness_pubkeys"][slot]
     horizon = now + FUTURE_SKEW
     if rec["event_ts"] > horizon or rec["departure_ts"] > horizon or rec["arrival_ts"] > horizon:
         return bad
-    out = {
-        "kind": SRC_OUTAGE,
-        "stage": stage,
-        "bucket": 0,
-        "manifest_hash": rec["manifest_hash"],
-        "event_ts": rec["event_ts"],
-    }
     status = rec["status"]
+    event_ts = rec["event_ts"]
+    binding = rec["binding"]
     if status == FS_ABORTED:
-        out["kind"] = SRC_REJECT
-        out["bucket"] = BUCKET_3_SPOILED_OR_REJECTED
-        return out
+        return _outcome(SRC_REJECT, stage, BUCKET_3_SPOILED_OR_REJECTED, event_ts, witness_hex, binding)
     latest = terms["latest_arrival_ts"]
     if stage == STAGE_1_DEPARTURE:
         if status == FS_DEPARTED or status == FS_CLEARED or status == FS_CUSTOMS_REJECTED:
             if rec["departure_ts"] > 0 and rec["departure_ts"] <= latest:
-                out["kind"] = SRC_POSITIVE
-                return out
+                return _outcome(SRC_POSITIVE, stage, 0, event_ts, witness_hex, binding)
         return bad
     # Stage 2
     if status == FS_DEPARTED:
-        out["kind"] = SRC_LAG
-        return out
+        return _outcome(SRC_LAG, stage, 0, event_ts, witness_hex, binding)
     if status == FS_CUSTOMS_REJECTED:
-        out["kind"] = SRC_REJECT
-        out["bucket"] = BUCKET_3_SPOILED_OR_REJECTED
-        return out
+        return _outcome(SRC_REJECT, stage, BUCKET_3_SPOILED_OR_REJECTED, event_ts, witness_hex, binding)
     if status == FS_CLEARED:
         if rec["arrival_ts"] <= 0 or rec["departure_ts"] <= 0:
             return bad
         if rec["arrival_ts"] < rec["departure_ts"]:
             return bad
-        out["kind"] = SRC_POSITIVE
-        out["bucket"] = classify_bucket(
+        bucket = classify_bucket(
             terms["max_temp_tenths_c"], rec["peak_temp_tenths_c"], rec["arrival_ts"], latest
         )
-        return out
+        return _outcome(SRC_POSITIVE, stage, bucket, event_ts, witness_hex, binding)
     return bad
 
 
 def aggregate(outcomes, stage: int) -> dict:
-    """The fault-tolerant 5-step quorum.
+    """The fault-tolerant independent-corroboration quorum.
 
-    1. Each source is already reduced to POS / REJ / LAG / OUT (404, lag and
-       outages never vote).
-    2. Group the explicit rejections by manifest_hash.
-    3. >= 2 matching rejections            -> verdict 0 (CONFIRMED_CARGO_REJECTION).
-    4. Group the positives by (stage, bucket, manifest_hash).
-    5. >= 2 matching positives             -> verdict 1 (VERIFIED_SETTLEMENT);
+    1. Each source is already reduced to POS / REJ / LAG / OUT (404, lag,
+       outages and unauthenticated payloads never vote).
+    2. Group explicit rejections, and positives by (stage, bucket).
+    3. A group only counts DISTINCT witness keys: two records signed by the
+       same key are one voice.
+    4. >= 2 distinct witnesses reject              -> verdict 0
+       (CONFIRMED_CARGO_REJECTION);
+       >= 2 distinct witnesses agree on a bucket   -> verdict 1
+       (VERIFIED_SETTLEMENT);
        anything else (incl. 1 CONFIRMED + 2x404, 1 CONFIRMED + 404 + OUTAGE,
-       fewer than 2 responders, or no two sources agreeing) -> verdict 2
+       fewer than 2 responders, or no two witnesses agreeing) -> verdict 2
        (QUORUM_FAILURE: retryable, mutates nothing).
     """
     groups_rej = {}
     groups_pos = {}
-    responders = 0
+    responders = set()
     for o in outcomes:
         if o["kind"] == SRC_REJECT:
-            responders += 1
-            groups_rej.setdefault(o["manifest_hash"], []).append(o)
+            responders.add(o["signer"])
+            groups_rej.setdefault((o["stage"], o["bucket"], o["binding"]), []).append(o)
         elif o["kind"] == SRC_POSITIVE:
-            responders += 1
-            key = (o["stage"], o["bucket"], o["manifest_hash"])
-            groups_pos.setdefault(key, []).append(o)
-    for mhash in sorted(groups_rej.keys()):
-        grp = groups_rej[mhash]
-        if len(grp) >= 2:
+            responders.add(o["signer"])
+            groups_pos.setdefault((o["stage"], o["bucket"], o["binding"]), []).append(o)
+    for key in sorted(groups_rej.keys()):
+        grp = groups_rej[key]
+        signers = {g["signer"] for g in grp}
+        if len(signers) >= 2:
             return {
                 "verdict": VERDICT_REJECTION,
                 "stage": stage,
                 "bucket": BUCKET_3_SPOILED_OR_REJECTED,
-                "source_count": len(grp),
-                "manifest_hash": mhash,
+                "source_count": len(signers),
+                "evidence_digest": corroboration_digest(key[2], key[0], key[1], SRC_REJECT),
                 "event_ts": max(g["event_ts"] for g in grp),
             }
     for key in sorted(groups_pos.keys()):
         grp = groups_pos[key]
-        if len(grp) >= 2:
+        signers = {g["signer"] for g in grp}
+        if len(signers) >= 2:
             return {
                 "verdict": VERDICT_VERIFIED,
                 "stage": key[0],
                 "bucket": key[1],
-                "source_count": len(grp),
-                "manifest_hash": key[2],
+                "source_count": len(signers),
+                "evidence_digest": corroboration_digest(key[2], key[0], key[1], SRC_POSITIVE),
                 "event_ts": max(g["event_ts"] for g in grp),
             }
     return {
         "verdict": VERDICT_QUORUM_FAILURE,
         "stage": stage,
         "bucket": 0,
-        "source_count": responders,
-        "manifest_hash": "",
+        "source_count": len(responders),
+        "evidence_digest": "",
         "event_ts": 0,
     }
 
 
-PAYLOAD_KEYS = ("bucket", "event_ts", "manifest_hash", "source_count", "stage", "verdict")
+PAYLOAD_KEYS = ("bucket", "event_ts", "evidence_digest", "source_count", "stage", "verdict")
 
 
 def payload_well_formed(p) -> bool:
@@ -494,15 +581,15 @@ def payload_well_formed(p) -> bool:
     for key in ("verdict", "stage", "bucket", "source_count", "event_ts"):
         if not _is_int(p[key]):
             return False
-    if not isinstance(p["manifest_hash"], str):
+    if not isinstance(p["evidence_digest"], str):
         return False
     if p["verdict"] not in (0, 1, 2) or p["stage"] not in (1, 2):
         return False
     if p["bucket"] < 0 or p["bucket"] > 3 or p["source_count"] < 0 or p["source_count"] > 3:
         return False
     if p["verdict"] == VERDICT_QUORUM_FAILURE:
-        return p["manifest_hash"] == "" and p["event_ts"] == 0 and p["bucket"] == 0
-    return _unhex(p["manifest_hash"], 32) is not None and p["source_count"] >= 2
+        return p["evidence_digest"] == "" and p["event_ts"] == 0 and p["bucket"] == 0
+    return _unhex(p["evidence_digest"], 32) is not None and p["source_count"] >= 2
 
 
 def run_validator(leader_payload, own_payload) -> bool:
@@ -549,55 +636,59 @@ def fetch_source(url: str) -> tuple:
 
 def collect_and_aggregate(urls: list, terms: dict, stage: int, now: int) -> dict:
     outcomes = []
-    for url in urls:
-        kind, rec = fetch_source(url)
-        if kind == SRC_LAG:
-            outcomes.append(
-                {"kind": SRC_LAG, "stage": stage, "bucket": 0, "manifest_hash": "", "event_ts": 0}
-            )
-        elif kind == SRC_OUTAGE:
-            outcomes.append(
-                {"kind": SRC_OUTAGE, "stage": stage, "bucket": 0, "manifest_hash": "", "event_ts": 0}
-            )
+    for slot in range(len(urls)):
+        kind, rec = fetch_source(urls[slot])
+        if kind == SRC_LAG or kind == SRC_OUTAGE:
+            outcomes.append(_outcome(kind, stage))
         else:
-            outcomes.append(evaluate_record(rec, terms, stage, now))
+            outcomes.append(evaluate_record(rec, terms, stage, now, slot))
     return aggregate(outcomes, stage)
 
 
-def validate_feed_url(index: int, url: str):
-    """Strictly pinned feed URL for operator `index`. Returns the 40-hex commit
-    SHA or raises ERR_INVALID_FEED_URL."""
-    if not isinstance(url, str) or len(url) > 300:
+def _evidence_host(url) -> str:
+    """Lowercase DNS hostname of a strictly shaped https URL, or raises."""
+    if not isinstance(url, str) or len(url) > MAX_URL_LEN:
         raise _err(ERR_BAD_FEED_URL, "type or length")
-    host = FEED_HOSTS[index]
-    folder = FEED_DIRS[index]
-    prefix = "https://" + host
-    if not url.startswith(prefix + "/"):
-        raise _err(ERR_BAD_FEED_URL, "host must be " + host)
-    path = url[len(prefix) :]
-    if "?" in path or "#" in path or "%" in path or "\\" in path or ".." in path or "//" in path:
-        raise _err(ERR_BAD_FEED_URL, "illegal characters")
-    tail = "/deployments/mock_feeds/" + folder + "/"
-    if index == 1:
-        head = "/gh/" + REPO_OWNER + "/" + REPO_NAME + "@"
-    else:
-        head = "/" + REPO_OWNER + "/" + REPO_NAME + "/"
-    if not path.startswith(head):
-        raise _err(ERR_BAD_FEED_URL, "repository must be " + REPO_OWNER + "/" + REPO_NAME)
-    rest = path[len(head) :]
-    sha = rest[:40]
-    if _unhex(sha, 20) is None:
-        raise _err(ERR_BAD_FEED_URL, "commit sha must be 40 lowercase hex")
-    rest = rest[40:]
-    if not rest.startswith(tail):
-        raise _err(ERR_BAD_FEED_URL, "path must be under " + tail)
-    name = rest[len(tail) :]
-    if len(name) < 6 or len(name) > 64 or not name.endswith(".json"):
-        raise _err(ERR_BAD_FEED_URL, "file must be <name>.json")
-    for ch in name:
-        if ch not in _FILE_CHARS:
-            raise _err(ERR_BAD_FEED_URL, "file name charset")
-    return sha
+    if not url.startswith("https://"):
+        raise _err(ERR_BAD_FEED_URL, "https required")
+    rest = url[8:]
+    slash = rest.find("/")
+    if slash <= 0 or slash == len(rest) - 1:
+        raise _err(ERR_BAD_FEED_URL, "host and path required")
+    host = rest[:slash]
+    path = rest[slash:]
+    for ch in path:
+        if ch not in _PATH_CHARS:
+            raise _err(ERR_BAD_FEED_URL, "illegal path character")
+    if ".." in path or "//" in path:
+        raise _err(ERR_BAD_FEED_URL, "illegal path")
+    labels = host.split(".")
+    if len(host) > 253 or len(labels) < 2:
+        raise _err(ERR_BAD_FEED_URL, "host must be a DNS name")
+    for label in labels:
+        if len(label) == 0 or len(label) > 63 or label[0] == "-" or label[-1] == "-":
+            raise _err(ERR_BAD_FEED_URL, "host label")
+        for ch in label:
+            if ch not in _HOST_CHARS:
+                raise _err(ERR_BAD_FEED_URL, "host charset (lowercase DNS names only, no port or userinfo)")
+    if labels[-1].isdigit():
+        raise _err(ERR_BAD_FEED_URL, "IP literals are not allowed")
+    return host
+
+
+def validate_evidence_urls(urls) -> list:
+    """The three witness endpoints must be https DNS hosts, pairwise distinct,
+    and must not be static git-hosting mirrors. Returns the three hostnames.
+    Host choice does not decide trust (signatures do); it only has to give three
+    separate transport paths."""
+    hosts = [_evidence_host(u) for u in urls]
+    if len(set(hosts)) != 3:
+        raise _err(ERR_BAD_FEED_URL, "the three witness endpoints must be on distinct hosts")
+    for host in hosts:
+        for banned in MIRROR_DOMAINS:
+            if host == banned or host.endswith("." + banned):
+                raise _err(ERR_BAD_FEED_URL, "static git mirrors are not witness endpoints: " + banned)
+    return hosts
 
 
 # =============================================================================
@@ -610,13 +701,13 @@ class LetterOfCredit:
     importer: Address
     exporter: Address
     container_id: str
+    vessel_imo: str
     cargo_spec_hash: str
     max_temp_tenths_c: i256
     latest_arrival_ts: u256
     feed_a_url: str
     feed_b_url: str
     feed_c_url: str
-    commit_sha: str
     state: str
     created_at: u256
     accept_deadline: u256
@@ -631,8 +722,8 @@ class LetterOfCredit:
     stage1_settled: bool
     stage2_settled: bool
     final_bucket: u256
-    stage1_manifest_hash: str
-    stage2_manifest_hash: str
+    stage1_evidence_digest: str
+    stage2_evidence_digest: str
     stage1_sources: u256
     stage2_sources: u256
     stage1_event_ts: u256
@@ -642,6 +733,9 @@ class LetterOfCredit:
 
 class CargoClear(gl.contract.Contract):
     carrier_authority_pubkey: str
+    manifest_witness_pubkey: str
+    customs_witness_pubkey: str
+    telemetry_witness_pubkey: str
     deployer: Address
     lcs: TreeMap[str, LetterOfCredit]
     lc_count: u256
@@ -652,14 +746,33 @@ class CargoClear(gl.contract.Contract):
     state_counts: TreeMap[str, u256]
     total_unreleased: u256
 
-    def __init__(self, carrier_authority_pubkey: str):
-        raw = _unhex(carrier_authority_pubkey, 32)
-        if raw is None:
-            raise _err(ERR_PUBKEY, "32-byte lowercase hex required")
-        pt = _pt_decompress(raw)
-        if pt is None or _is_small_order(pt):
-            raise _err(ERR_PUBKEY, "not a usable Ed25519 point")
+    def __init__(
+        self,
+        carrier_authority_pubkey: str,
+        manifest_witness_pubkey: str,
+        customs_witness_pubkey: str,
+        telemetry_witness_pubkey: str,
+    ):
+        keys = (
+            carrier_authority_pubkey,
+            manifest_witness_pubkey,
+            customs_witness_pubkey,
+            telemetry_witness_pubkey,
+        )
+        for i in range(4):
+            code = ERR_PUBKEY if i == 0 else ERR_WITNESS_KEY
+            raw = _unhex(keys[i], 32)
+            if raw is None:
+                raise _err(code, "32-byte lowercase hex required")
+            pt = _pt_decompress(raw)
+            if pt is None or _is_small_order(pt):
+                raise _err(code, "not a usable Ed25519 point")
+        if len(set(keys)) != 4:
+            raise _err(ERR_WITNESS_KEY, "the carrier authority and the three witnesses need four distinct keys")
         self.carrier_authority_pubkey = carrier_authority_pubkey
+        self.manifest_witness_pubkey = manifest_witness_pubkey
+        self.customs_witness_pubkey = customs_witness_pubkey
+        self.telemetry_witness_pubkey = telemetry_witness_pubkey
         self.deployer = gl.message.sender_address
         self.lc_count = 0
         self.total_deposited = 0
@@ -677,6 +790,7 @@ class CargoClear(gl.contract.Contract):
             bol_record_id,
             lc.lc_id,
             lc.container_id,
+            lc.vessel_imo,
             _hex_of(lc.exporter),
             lc.cargo_spec_hash,
             int(lc.max_temp_tenths_c),
@@ -690,6 +804,14 @@ class CargoClear(gl.contract.Contract):
         pub = bytes.fromhex(self.carrier_authority_pubkey)
         msg = self._bol_message(lc, bol_record_id).encode("utf-8")
         return ed25519_verify(pub, msg, sig)
+
+    def _binding_of(self, lc: LetterOfCredit) -> str:
+        if not lc.bol_verified:
+            return ""
+        return evidence_binding(lc.bol_record_id, lc.container_id, lc.vessel_imo)
+
+    def _witness_pubkeys(self) -> list:
+        return [self.manifest_witness_pubkey, self.customs_witness_pubkey, self.telemetry_witness_pubkey]
 
     def _set_state(self, lc: LetterOfCredit, new_state: str) -> None:
         old = lc.state
@@ -716,12 +838,12 @@ class CargoClear(gl.contract.Contract):
             "importer": _hex_of(lc.importer),
             "exporter": _hex_of(lc.exporter),
             "container_id": lc.container_id,
+            "vessel_imo": lc.vessel_imo,
             "cargo_spec_hash": lc.cargo_spec_hash,
             "max_temp_tenths_c": int(lc.max_temp_tenths_c),
             "latest_arrival_ts": int(lc.latest_arrival_ts),
             "created_at": int(lc.created_at),
             "accept_deadline": int(lc.accept_deadline),
-            "commit_sha": lc.commit_sha,
             "total_deposited": int(lc.total_deposited),
             "unreleased_escrow": int(lc.unreleased),
             "exporter_claimable": int(lc.exporter_credited) - int(lc.exporter_withdrawn),
@@ -733,8 +855,9 @@ class CargoClear(gl.contract.Contract):
             "stage1_settled": lc.stage1_settled,
             "stage2_settled": lc.stage2_settled,
             "final_bucket": int(lc.final_bucket) if lc.stage2_settled else -1,
-            "stage1_manifest_hash": lc.stage1_manifest_hash,
-            "stage2_manifest_hash": lc.stage2_manifest_hash,
+            "evidence_binding": self._binding_of(lc),
+            "stage1_evidence_digest": lc.stage1_evidence_digest,
+            "stage2_evidence_digest": lc.stage2_evidence_digest,
             "stage1_sources": int(lc.stage1_sources),
             "stage2_sources": int(lc.stage2_sources),
             "stage1_event_ts": int(lc.stage1_event_ts),
@@ -743,17 +866,61 @@ class CargoClear(gl.contract.Contract):
         }
 
     @gl.public.view
-    def get_feed_sources(self, lc_id: str) -> dict:
+    def get_evidence_sources(self, lc_id: str) -> dict:
+        """The three witness slots of an L/C: role, endpoint, host and the
+        Ed25519 key every record from that slot must verify against."""
         lc = self._lc(lc_id)
         urls = (lc.feed_a_url, lc.feed_b_url, lc.feed_c_url)
+        keys = self._witness_pubkeys()
         return {
             "lc_id": lc.lc_id,
-            "commit_sha": lc.commit_sha,
-            "repository": "https://github.com/" + REPO_OWNER + "/" + REPO_NAME,
+            "vessel_imo": lc.vessel_imo,
+            "evidence_binding": self._binding_of(lc),
+            "evidence_schema": EVIDENCE_SCHEMA,
             "sources": [
-                {"role": FEED_ROLES[i], "host": FEED_HOSTS[i], "url": urls[i]} for i in range(3)
+                {
+                    "role": WITNESS_ROLES[i],
+                    "host": _evidence_host(urls[i]),
+                    "url": urls[i],
+                    "witness_pubkey": keys[i],
+                }
+                for i in range(3)
             ],
         }
+
+    @gl.public.view
+    def check_evidence(self, lc_id: str, slot: int, record_json: str) -> dict:
+        """Would the record authenticate as witness `slot` (0 carrier manifest,
+        1 port customs, 2 cold-chain AIS) for this L/C? Pure check, no fetch and
+        no state change: the same authentication settlement applies."""
+        lc = self._lc(lc_id)
+        if not _is_int(slot) or slot < 0 or slot > 2:
+            raise _err(ERR_PARAMS, "slot must be 0, 1 or 2")
+        if not lc.bol_verified:
+            raise _err(ERR_BOL_NOT_VERIFIED, "verify the bill of lading first")
+        if not isinstance(record_json, str) or len(record_json) > MAX_FEED_BODY:
+            raise _err(ERR_PARAMS, "record_json")
+        terms = {
+            "bol_record_id": lc.bol_record_id,
+            "container_id": lc.container_id,
+            "vessel_imo": lc.vessel_imo,
+            "binding": evidence_binding(lc.bol_record_id, lc.container_id, lc.vessel_imo),
+            "witness_pubkeys": self._witness_pubkeys(),
+        }
+        return {
+            "authentic": authenticate_record(parse_feed_json(record_json), terms, slot),
+            "role": WITNESS_ROLES[slot],
+            "witness_pubkey": terms["witness_pubkeys"][slot],
+            "binding": terms["binding"],
+        }
+
+    @gl.public.view
+    def get_evidence_binding(self, bol_record_id: str, container_id: str, vessel_imo: str) -> str:
+        """The nonce witnesses must sign for a shipment (sha256 over BoL id,
+        container and vessel IMO)."""
+        if not _valid_id(bol_record_id) or not _valid_id(container_id) or not valid_imo(vessel_imo):
+            raise _err(ERR_PARAMS, "bol_record_id / container_id / vessel_imo")
+        return evidence_binding(bol_record_id, container_id, vessel_imo)
 
     @gl.public.view
     def get_protocol_summary(self) -> dict:
@@ -767,6 +934,9 @@ class CargoClear(gl.contract.Contract):
         return {
             "protocol": "CargoClear",
             "carrier_authority_pubkey": self.carrier_authority_pubkey,
+            "witness_pubkeys": self._witness_pubkeys(),
+            "witness_roles": list(WITNESS_ROLES),
+            "evidence_schema": EVIDENCE_SCHEMA,
             "deployer": _hex_of(self.deployer),
             "lc_count": int(self.lc_count),
             "lc_state_counts": counts,
@@ -780,7 +950,6 @@ class CargoClear(gl.contract.Contract):
             "thermal_tolerance_tenths_c": THERMAL_TOLERANCE_TENTHS,
             "grace_seconds": GRACE_SECONDS,
             "acceptance_window_seconds": ACCEPTANCE_WINDOW,
-            "feed_hosts": list(FEED_HOSTS),
         }
 
     @gl.public.view
@@ -873,6 +1042,7 @@ class CargoClear(gl.contract.Contract):
         self,
         exporter: str,
         container_id: str,
+        vessel_imo: str,
         cargo_spec_hash: str,
         max_temp_tenths_c: int,
         latest_arrival_ts: int,
@@ -891,6 +1061,8 @@ class CargoClear(gl.contract.Contract):
             raise _err(ERR_PARAMS, "importer and exporter must differ")
         if not _valid_id(container_id):
             raise _err(ERR_PARAMS, "container_id")
+        if not valid_imo(vessel_imo):
+            raise _err(ERR_IMO, "7-digit IMO number with a valid check digit required")
         if _unhex(cargo_spec_hash, 32) is None:
             raise _err(ERR_PARAMS, "cargo_spec_hash must be sha256 hex")
         if not _is_int(max_temp_tenths_c) or max_temp_tenths_c < MIN_TEMP_TENTHS or max_temp_tenths_c > MAX_TEMP_TENTHS:
@@ -898,11 +1070,7 @@ class CargoClear(gl.contract.Contract):
         now = _now_ts()
         if not _is_int(latest_arrival_ts) or latest_arrival_ts <= now or latest_arrival_ts > now + 3 * 365 * 24 * 3600:
             raise _err(ERR_PARAMS, "latest_arrival_ts must be in the future")
-        sha_a = validate_feed_url(0, feed_a_url)
-        sha_b = validate_feed_url(1, feed_b_url)
-        sha_c = validate_feed_url(2, feed_c_url)
-        if sha_a != sha_b or sha_b != sha_c:
-            raise _err(ERR_BAD_FEED_URL, "all feeds must pin the same commit")
+        validate_evidence_urls((feed_a_url, feed_b_url, feed_c_url))
         n = int(self.lc_count) + 1
         lc_id = "LC-" + str(n)
         self.lcs[lc_id] = LetterOfCredit(
@@ -910,13 +1078,13 @@ class CargoClear(gl.contract.Contract):
             importer=importer_addr,
             exporter=exporter_addr,
             container_id=container_id,
+            vessel_imo=vessel_imo,
             cargo_spec_hash=cargo_spec_hash,
             max_temp_tenths_c=max_temp_tenths_c,
             latest_arrival_ts=latest_arrival_ts,
             feed_a_url=feed_a_url,
             feed_b_url=feed_b_url,
             feed_c_url=feed_c_url,
-            commit_sha=sha_a,
             state=ST_PENDING,
             created_at=now,
             accept_deadline=now + ACCEPTANCE_WINDOW,
@@ -931,8 +1099,8 @@ class CargoClear(gl.contract.Contract):
             stage1_settled=False,
             stage2_settled=False,
             final_bucket=0,
-            stage1_manifest_hash="",
-            stage2_manifest_hash="",
+            stage1_evidence_digest="",
+            stage2_evidence_digest="",
             stage1_sources=0,
             stage2_sources=0,
             stage1_event_ts=0,
@@ -992,9 +1160,9 @@ class CargoClear(gl.contract.Contract):
     @gl.public.write
     def verify_bill_of_lading(self, lc_id: str, bol_record_id: str, attestation_signature: str) -> str:
         """Verifies the Carrier Authority's Ed25519 signature over
-        bol_record_id|lc_id|container_id|exporter_address|cargo_spec_hash|
-        max_temp_tenths_c|latest_arrival_ts. Any mismatch reverts BEFORE any
-        fetch or state change."""
+        bol_record_id|lc_id|container_id|vessel_imo|exporter_address|
+        cargo_spec_hash|max_temp_tenths_c|latest_arrival_ts. Any mismatch
+        reverts BEFORE any fetch or state change."""
         lc = self._lc(lc_id)
         sender = gl.message.sender_address
         if sender != lc.importer and sender != lc.exporter:
@@ -1014,7 +1182,7 @@ class CargoClear(gl.contract.Contract):
         lc.bol_verified = True
         return bol_record_id
 
-    # -------------------------------------------- 3-host 2-of-3 settlement
+    # ------------------------- 3 signed witnesses, 2-of-3 independent quorum
     @gl.public.write
     def settle_shipment_stage(self, lc_id: str, stage: int) -> str:
         lc = self._lc(lc_id)
@@ -1035,8 +1203,10 @@ class CargoClear(gl.contract.Contract):
         urls = [lc.feed_a_url, lc.feed_b_url, lc.feed_c_url]
         terms = {
             "bol_record_id": lc.bol_record_id,
-            "lc_id": lc.lc_id,
             "container_id": lc.container_id,
+            "vessel_imo": lc.vessel_imo,
+            "binding": evidence_binding(lc.bol_record_id, lc.container_id, lc.vessel_imo),
+            "witness_pubkeys": self._witness_pubkeys(),
             "latest_arrival_ts": int(lc.latest_arrival_ts),
             "max_temp_tenths_c": int(lc.max_temp_tenths_c),
         }
@@ -1067,7 +1237,7 @@ class CargoClear(gl.contract.Contract):
                 # the importer is made whole with everything still in escrow.
                 self._credit_importer_all(lc)
                 self._set_state(lc, ST_ABORTED)
-                lc.stage1_manifest_hash = payload["manifest_hash"]
+                lc.stage1_evidence_digest = payload["evidence_digest"]
                 lc.stage1_sources = payload["source_count"]
                 lc.stage1_event_ts = payload["event_ts"]
                 return
@@ -1077,7 +1247,7 @@ class CargoClear(gl.contract.Contract):
             lc.stage1_settled = True
             self.total_unreleased = int(self.total_unreleased) - amount
             self._set_state(lc, ST_STAGE_1)
-            lc.stage1_manifest_hash = payload["manifest_hash"]
+            lc.stage1_evidence_digest = payload["evidence_digest"]
             lc.stage1_sources = payload["source_count"]
             lc.stage1_event_ts = payload["event_ts"]
             return
@@ -1090,7 +1260,7 @@ class CargoClear(gl.contract.Contract):
         lc.stage2_settled = True
         lc.final_bucket = bucket
         self._set_state(lc, ST_COMPLETED)
-        lc.stage2_manifest_hash = payload["manifest_hash"]
+        lc.stage2_evidence_digest = payload["evidence_digest"]
         lc.stage2_sources = payload["source_count"]
         lc.stage2_event_ts = payload["event_ts"]
 

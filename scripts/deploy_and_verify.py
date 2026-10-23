@@ -1,23 +1,29 @@
-"""Autonomous Studio Next deployment + live end-to-end proof for CargoClear.
+"""Autonomous Studio Next deployment + live validation for CargoClear (evidence v2).
 
-    .venv/bin/python scripts/deploy_and_verify.py [--contract 0x...] [--feed-sha <40 hex>]
+    .venv/bin/python scripts/deploy_and_verify.py [--contract 0x...] [--witness-urls A B C]
 
-Everything runs unattended:
+Everything runs unattended and publishes nothing outside Studio Next:
 
-  1. loads the two fresh project wallets (cargoclear-importer / cargoclear-exporter),
-     funds them from the Studio Next faucet and, if the faucet credits nothing,
-     from any unlocked local CLI account that holds a balance;
-  2. deploys contracts/cargo_clear.py with the Carrier Authority's Ed25519 public key;
-  3. opens LC-1 (importer) and accepts it (exporter);
-  4. submits a FORGED Bill of Lading signature and records the finalized rejection
-     (ERR_INVALID_BOL_ATTESTATION) -- no HTTP fetch, no state change;
-  5. submits the genuine Carrier Authority signature, then settles Stage 1 and
-     Stage 2 through real 2-of-3 consensus over the three pinned CDN feeds;
-  6. withdraws both parties' balances;
-  7. records every finalized tx hash and the exact gen_call readbacks in
-     deployments/studio-next.json plus the ABI in deployments/cargo_clear_abi.json.
+  1. loads the two project wallets (cargoclear-importer / cargoclear-exporter) and the
+     four demo Ed25519 keys (Carrier Authority + three witnesses, all in git-ignored
+     .secrets/); funds the wallets from the Studio Next faucet;
+  2. proves on-chain that a deployment reusing one key for two roles is refused, then
+     deploys contracts/cargo_clear.py with the carrier key and the three witness keys;
+  3. proves the open-time guards live: bad IMO check digit, git-mirror endpoint and
+     duplicate endpoint hosts all revert;
+  4. opens LC-1 and accepts it;
+  5. forged Bill of Lading (rejected), genuine Bill of Lading (accepted, IMO signed in);
+  6. `check_evidence` readbacks: authentic / tampered / wrong-slot / unregistered key /
+     wrong-shipment records, judged by the deployed contract;
+  7. settle_shipment_stage against witness endpoints that serve nothing: fail-closed
+     QUORUM_FAILURE, no funds move, the call is retryable;
+  8. records every tx hash and readback in deployments/studio-next.json plus the ABI in
+     deployments/cargo_clear_abi.json.
 
-Private keys live in .secrets/ (git-ignored) and never touch the repository.
+By default the three endpoints are RESERVED-TLD placeholders (`.example`, RFC 2606: can
+never resolve): this repository has no real maritime providers behind it, and nothing
+here stands one up. Pass --witness-urls to point the contract at real endpoints whose
+operators hold the registered witness keys. Private keys never touch the repository.
 """
 
 import argparse
@@ -41,22 +47,38 @@ from genlayer_py.chains import studio_devnet
 from genlayer_py.contracts.actions import _estimate_transaction_fees_with_policy, get_current_fee_policy
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+import cargoclear_witness as witness  # noqa: E402
+
 SECRETS = ROOT / ".secrets"
 RPC = "https://studio-next.genlayer.com/api"
 EXPLORER = "https://explorer-studio-next.genlayer.com"
 CHAIN_ID = 61997
-OWNER, REPO = "moltaphet", "CargoClear"
 
-# L/C terms. Shapes match deployments/mock_feeds (see scripts/make_fixtures.py).
+# L/C terms. The shipment: one reefer container on one vessel under one Bill of Lading.
 PRINCIPAL = 50_000_000_000_000_003  # 0.05 GEN + 3 wei: not divisible by 5, so dust is exercised live
-BOL_ID = "BOL-CC-20261009-0001"
+BOL_ID = "BOL-CC-20261023-0001"
 CONTAINER = "MSKU4471290"
+VESSEL_IMO = "9074729"  # check-digit-valid demo IMO
 CARGO_SPEC = "Frozen Atlantic shrimp, grade A, 18 t, reefer -18.0C"
 MAX_TEMP_TENTHS_C = -180
-LATEST_ARRIVAL_TS = 1_792_886_400  # 2026-10-25T00:00:00Z
+LATEST_ARRIVAL_TS = 1_794_700_800  # 2026-11-15T00:00:00Z
 
-NEED_IMPORTER = 250 * 10**15  # principal + fee deposits with headroom
-NEED_EXPORTER = 60 * 10**15
+# Scenario timeline for the sample witness records (all in the past of the chain clock).
+DEPARTURE_TS = 1_791_532_800  # 2026-10-09T08:00:00Z
+ARRIVAL_TS = 1_792_247_400  # 2026-10-17T14:30:00Z
+EVENT_TS = 1_792_252_800  # 2026-10-17T16:00:00Z
+PEAK_TENTHS_C = -160
+
+# Placeholder endpoints: three distinct, never-resolving hosts (RFC 2606 `.example`).
+PLACEHOLDER_URLS = [
+    f"https://carrier-witness.unprovisioned.example/v1/evidence/{CONTAINER}",
+    f"https://customs-witness.unprovisioned.example/v1/evidence/{CONTAINER}",
+    f"https://ais-witness.unprovisioned.example/v1/evidence/{CONTAINER}",
+]
+
+NEED_IMPORTER = 150 * 10**15  # principal + fee deposits with headroom
+NEED_EXPORTER = 40 * 10**15
 
 
 def log(*a):
@@ -221,7 +243,9 @@ def outcome_of(tx: dict) -> dict:
 def send(client, label, fn, steps, **kw):
     """Submit one transaction, wait for FINALIZATION, and record the outcome."""
     t0 = time.time()
-    tx_hash = fn(fees=fee_options(client), **kw)
+    # A dropped connection while the SDK estimates gas happens before anything is signed
+    # or sent, so retrying the submission is safe.
+    tx_hash = retry(lambda: fn(fees=fee_options(client), **kw), attempts=4, wait=8.0)
     h = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
     h = h if h.startswith("0x") else "0x" + h
     log(f"{label}: submitted {h}")
@@ -248,32 +272,34 @@ def read(client, address, method, args=None):
     return retry(lambda: jsonable(client.read_contract(address, method, args=args or [])))
 
 
-def git_feed_sha() -> str:
-    return subprocess.check_output(
-        ["git", "log", "-1", "--format=%H", "--", "deployments/mock_feeds"], cwd=ROOT, text=True
-    ).strip()
+def sample_record(name: str, signer=None, **over) -> dict:
+    """A witness-signed record for the L/C's shipment (signed by `signer`, default the witness's own key)."""
+    fields = dict(
+        bol=BOL_ID, container=CONTAINER, imo=VESSEL_IMO, status="CUSTOMS_CLEARED",
+        departure_ts=DEPARTURE_TS, arrival_ts=ARRIVAL_TS, event_ts=EVENT_TS, peak=PEAK_TENTHS_C,
+    )
+    fields.update(over)
+    return witness.evidence(name, signer or witness.load_signer(name), **fields)
 
 
-def feed_urls(sha: str) -> list:
-    name = "LC-1.json"
-    return [
-        f"https://raw.githubusercontent.com/{OWNER}/{REPO}/{sha}/deployments/mock_feeds/a/{name}",
-        f"https://cdn.jsdelivr.net/gh/{OWNER}/{REPO}@{sha}/deployments/mock_feeds/b/{name}",
-        f"https://raw.githack.com/{OWNER}/{REPO}/{sha}/deployments/mock_feeds/c/{name}",
-    ]
+def reverted(out: dict, code: str) -> bool:
+    return out["execution"] == "FINISHED_WITH_ERROR" and code in json.dumps(out)
 
 
 # ------------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--contract", help="reuse an already deployed address instead of deploying")
-    ap.add_argument("--feed-sha", default=None)
+    ap.add_argument("--witness-urls", nargs=3, metavar=("MANIFEST", "CUSTOMS", "TELEMETRY"), default=None)
     ap.add_argument("--out", default=str(ROOT / "deployments" / "studio-next.json"))
     ns = ap.parse_args()
+    urls = ns.witness_urls or PLACEHOLDER_URLS
 
     importer, exporter = load_account("importer"), load_account("exporter")
     carrier = carrier_key()
     carrier_pub = carrier.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    wit = {n: witness.load_signer(n) for n in ("manifest", "customs", "telemetry")}
+    wit_pub = [witness.pubkey_hex(wit[n]) for n in ("manifest", "customs", "telemetry")]
     impostor = Ed25519PrivateKey.from_private_bytes(hashlib.sha256(b"CargoClear forged carrier").digest())
     c_imp, c_exp = client_for(importer), client_for(exporter)
     c_ro = client_for(importer)  # reads need a connected account; nothing is signed with it
@@ -293,6 +319,9 @@ def main() -> int:
             "cargoclear-exporter": exporter.address,
         },
         "carrier_authority_pubkey": carrier_pub,
+        "witness_pubkeys": dict(zip(("manifest", "customs", "telemetry"), wit_pub)),
+        "witness_endpoints": urls,
+        "witness_endpoints_are_placeholders": ns.witness_urls is None,
         "steps": [],
     }
     steps = rec["steps"]
@@ -306,40 +335,66 @@ def main() -> int:
         "exporter": balance(c_ro, exporter.address),
     }
 
-    feed_sha = ns.feed_sha or git_feed_sha()
-    urls = feed_urls(feed_sha)
-    rec["feed_commit_sha"] = feed_sha
-    rec["feed_urls"] = urls
-
     source = (ROOT / "contracts" / "cargo_clear.py").read_text()
-    source_sha = hashlib.sha256(source.encode()).hexdigest()
     rec["source"] = "contracts/cargo_clear.py"
-    rec["source_sha256"] = source_sha
+    rec["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
     rec["runner"] = source.splitlines()[1].split('"Depends": ')[1].strip(' "}')
 
-    # ---- 1. deploy ---------------------------------------------------------
+    # ---- 1. deploy (after proving key reuse is refused) -----------------------
     if ns.contract:
         address = ns.contract
         log(f"reusing contract {address}")
     else:
-        out, tx = send(c_imp, "deploy", c_imp.deploy_contract, steps, code=source, args=[carrier_pub])
+        dup, _ = send(
+            c_imp, "deploy[REFUSED: witness key == carrier key]", c_imp.deploy_contract, steps,
+            code=source, args=[carrier_pub, carrier_pub, wit_pub[1], wit_pub[2]],
+        )
+        dup["refused_with_ERR_INVALID_WITNESS_PUBKEY"] = reverted(dup, "ERR_INVALID_WITNESS_PUBKEY")
+        assert dup["refused_with_ERR_INVALID_WITNESS_PUBKEY"], dup
+        out, tx = send(c_imp, "deploy", c_imp.deploy_contract, steps, code=source, args=[carrier_pub, *wit_pub])
         assert out["execution"] == "FINISHED_WITH_RETURN", out
         address = tx.get("recipient") or tx.get("to_address")
         out["contract_address"] = address
     rec["contract_address"] = address
     rec["contract_explorer_url"] = f"{EXPLORER}/address/{address}"
     log(f"contract {address}")
+    rec["readback_constructor"] = read(c_ro, address, "get_protocol_summary")
+    assert rec["readback_constructor"]["witness_pubkeys"] == wit_pub
+    assert rec["readback_constructor"]["carrier_authority_pubkey"] == carrier_pub
 
-    # ---- 2. open + accept ----------------------------------------------------
-    lc_id = read(c_ro, address, "get_protocol_summary")["lc_count"] + 1
-    lc_id = f"LC-{lc_id}"
+    # ---- 2. open-time guards, live ------------------------------------------------
+    cargo_hash = hashlib.sha256(CARGO_SPEC.encode()).hexdigest()
+    exporter_hex = exporter.address.lower()
+
+    def open_args(imo=VESSEL_IMO, endpoints=urls):
+        return [exporter_hex, CONTAINER, imo, cargo_hash, MAX_TEMP_TENTHS_C, LATEST_ARRIVAL_TS, *endpoints]
+
+    mirrors = [
+        f"https://raw.githubusercontent.com/moltaphet/CargoClear/{'a' * 40}/deployments/x/{CONTAINER}.json",
+        urls[1], urls[2],
+    ]
+    same_host = [urls[0], urls[0].replace("/v1/evidence/", "/v2/evidence/"), urls[2]]
+    guards = [
+        ("bad IMO check digit", open_args(imo="9074720"), "ERR_INVALID_VESSEL_IMO"),
+        ("git-mirror endpoint", open_args(endpoints=mirrors), "ERR_INVALID_FEED_URL"),
+        ("one host in two slots", open_args(endpoints=same_host), "ERR_INVALID_FEED_URL"),
+    ]
+    rec["open_guards"] = []
+    for name, args, code in guards:
+        out, _ = send(
+            c_imp, f"open_letter_of_credit[REFUSED: {name}]", c_imp.write_contract, steps,
+            address=address, function_name="open_letter_of_credit", value=PRINCIPAL, args=args,
+        )
+        ok_ = reverted(out, code)
+        rec["open_guards"].append({"case": name, "expected": code, "refused": ok_, "tx_hash": out["tx_hash"]})
+        assert ok_, out
+    assert read(c_ro, address, "get_protocol_summary")["lc_count"] == 0
+
+    # ---- 3. open + accept ----------------------------------------------------------
+    lc_id = "LC-1"
     open_out, _ = send(
         c_imp, "open_letter_of_credit", c_imp.write_contract, steps,
-        address=address, function_name="open_letter_of_credit", value=PRINCIPAL,
-        args=[
-            exporter.address.lower(), CONTAINER, hashlib.sha256(CARGO_SPEC.encode()).hexdigest(),
-            MAX_TEMP_TENTHS_C, LATEST_ARRIVAL_TS, *urls,
-        ],
+        address=address, function_name="open_letter_of_credit", value=PRINCIPAL, args=open_args(),
     )
     assert open_out["execution"] == "FINISHED_WITH_RETURN", open_out
     rec["lc_id"] = lc_id
@@ -350,12 +405,10 @@ def main() -> int:
     assert accept_out["execution"] == "FINISHED_WITH_RETURN", accept_out
     rec["readback_after_accept"] = read(c_ro, address, "get_lc_state", [lc_id])
 
-    # ---- 3. Ed25519: forged rejection, then the genuine attestation -----------
+    # ---- 4. Ed25519 BoL: forged rejection, then the genuine attestation -------------
     message = read(c_ro, address, "get_bol_message", [lc_id, BOL_ID])
-    exporter_hex = exporter.address.lower()
     expected = "|".join(
-        [BOL_ID, lc_id, CONTAINER, exporter_hex, hashlib.sha256(CARGO_SPEC.encode()).hexdigest(),
-         str(MAX_TEMP_TENTHS_C), str(LATEST_ARRIVAL_TS)]
+        [BOL_ID, lc_id, CONTAINER, VESSEL_IMO, exporter_hex, cargo_hash, str(MAX_TEMP_TENTHS_C), str(LATEST_ARRIVAL_TS)]
     )
     assert message == expected, (message, expected)
     rec["bol_canonical_message"] = message
@@ -374,14 +427,14 @@ def main() -> int:
     forged_out["forged_signature"] = forged_sig
     forged_out["state_unchanged"] = before == after
     forged_out["bol_verified_after"] = after["bol_verified"]
-    blob = json.dumps(forged_out)
-    forged_out["rejected_with_ERR_INVALID_BOL_ATTESTATION"] = "ERR_INVALID_BOL_ATTESTATION" in blob
+    forged_out["rejected_with_ERR_INVALID_BOL_ATTESTATION"] = reverted(forged_out, "ERR_INVALID_BOL_ATTESTATION")
     rec["forged_bol_rejection"] = {
         k: forged_out.get(k)
         for k in ("tx_hash", "explorer", "execution", "consensus", "lifecycle", "result_text",
                   "state_unchanged", "bol_verified_after", "rejected_with_ERR_INVALID_BOL_ATTESTATION",
                   "forged_signature")
     }
+    assert forged_out["state_unchanged"] and forged_out["rejected_with_ERR_INVALID_BOL_ATTESTATION"]
 
     genuine_out, _ = send(
         c_imp, "verify_bill_of_lading[GENUINE]", c_imp.write_contract, steps,
@@ -390,42 +443,64 @@ def main() -> int:
     assert genuine_out["execution"] == "FINISHED_WITH_RETURN", genuine_out
     genuine_out["genuine_signature"] = genuine_sig
 
-    # ---- 4. staged settlement over the three pinned CDN feeds ------------------
-    for stage, name in ((1, "STAGE_1_DEPARTURE"), (2, "STAGE_2_CUSTOMS_CLEARED")):
-        out = None
-        for attempt in range(1, 4):  # QUORUM_FAILURE is retryable by design
-            out, _ = send(
-                c_imp, f"settle_shipment_stage[{name}]", c_imp.write_contract, steps,
-                address=address, function_name="settle_shipment_stage", args=[lc_id, stage],
-            )
-            text = out.get("result_text") or ""
-            if '"verdict": 1' in text or '"verdict":1' in text or '"verdict": 0' in text:
-                break
-            log(f"stage {stage} attempt {attempt}: not settled yet, retrying in 20s")
-            time.sleep(20)
-        out["stage"] = stage
-        out["stage_name"] = name
-        rec[f"readback_after_stage{stage}"] = read(c_ro, address, "get_lc_state", [lc_id])
+    # ---- 5. evidence authentication, judged by the deployed contract ----------------
+    binding = read(c_ro, address, "get_evidence_binding", [BOL_ID, CONTAINER, VESSEL_IMO])
+    assert binding == witness.binding(BOL_ID, CONTAINER, VESSEL_IMO)
+    rec["evidence_binding"] = binding
+    names = ("manifest", "customs", "telemetry")
 
-    # ---- 5. authoritative readbacks (settled, before withdrawal) ---------------
+    def check(slot, record_dict):
+        return read(c_ro, address, "check_evidence", [lc_id, slot, witness.compact(record_dict)])
+
+    checks = []
+    for slot, n in enumerate(names):
+        authentic = sample_record(n)
+        res = check(slot, authentic)
+        checks.append({"case": f"authentic record from the {n} witness, slot {slot}", "record": authentic,
+                       "expect_authentic": True, "result": res})
+        assert res["authentic"] is True, res
+    manifest_rec = sample_record("manifest")
+    negative = [
+        ("tampered after signing (peak 1 tenth colder)", 0, {**manifest_rec, "peak_temp_tenths_c": PEAK_TENTHS_C - 1}),
+        ("right record, wrong slot (manifest record offered as customs)", 1, manifest_rec),
+        ("valid shape, signed by an unregistered key", 0, sample_record("manifest", signer=impostor)),
+        ("carrier authority key signing evidence", 0, sample_record("manifest", signer=carrier)),
+        ("another witness's key signing as the manifest witness", 0, sample_record("manifest", signer=wit["customs"])),
+        ("registered witness, but a different shipment (other BoL)", 0, sample_record("manifest", bol=BOL_ID + "-X")),
+        ("registered witness, but a different vessel IMO", 0, sample_record("manifest", imo="9321483")),
+        ("unsigned record", 0, {k: v for k, v in manifest_rec.items() if k != "signature"}),
+    ]
+    for case, slot, r in negative:
+        res = check(slot, r)
+        checks.append({"case": case, "record": r, "expect_authentic": False, "result": res})
+        assert res["authentic"] is False, (case, res)
+    rec["check_evidence"] = checks
+
+    # ---- 6. fail-closed settlement: endpoints that serve no authentic evidence ------
+    before = read(c_ro, address, "get_lc_state", [lc_id])
+    settle_out, _ = send(
+        c_imp, "settle_shipment_stage[STAGE_1, no authentic evidence]", c_imp.write_contract, steps,
+        address=address, function_name="settle_shipment_stage", args=[lc_id, 1],
+    )
+    after = read(c_ro, address, "get_lc_state", [lc_id])
+    payload = json.loads(settle_out["result_text"]) if settle_out["execution"] == "FINISHED_WITH_RETURN" else {}
+    settle_out["quorum_failure"] = payload.get("verdict") == 2 and payload.get("source_count") == 0
+    movable = ("state", "unreleased_escrow", "exporter_claimable", "importer_rebate", "stage1_settled", "stage2_settled")
+    settle_out["funds_and_state_unchanged"] = all(before[k] == after[k] for k in movable)
+    settle_out["quorum_failures_counter"] = after["quorum_failures"]
+    rec["fail_closed_settlement"] = {
+        k: settle_out.get(k)
+        for k in ("tx_hash", "explorer", "execution", "consensus", "lifecycle", "result_text", "quorum_failure",
+                  "funds_and_state_unchanged", "quorum_failures_counter")
+    }
+    assert settle_out["quorum_failure"] and settle_out["funds_and_state_unchanged"], settle_out
+    assert after["quorum_failures"] == before["quorum_failures"] + 1
+
+    # ---- 7. authoritative readbacks -------------------------------------------------
     rec["readbacks"] = {
         "get_lc_state": read(c_ro, address, "get_lc_state", [lc_id]),
         "get_protocol_summary": read(c_ro, address, "get_protocol_summary"),
-        "get_feed_sources": read(c_ro, address, "get_feed_sources", [lc_id]),
-        "verify_solvency_invariant": read(c_ro, address, "verify_solvency_invariant"),
-    }
-
-    # ---- 6. pull-pattern withdrawals ---------------------------------------------
-    send(c_exp, "claim_funds[exporter]", c_exp.write_contract, steps,
-         address=address, function_name="claim_funds", args=[lc_id])
-    rebate = rec["readbacks"]["get_lc_state"]["importer_rebate"]
-    if rebate > 0:
-        send(c_imp, "claim_funds[importer]", c_imp.write_contract, steps,
-             address=address, function_name="claim_funds", args=[lc_id])
-    time.sleep(8)
-    rec["readbacks_after_claims"] = {
-        "get_lc_state": read(c_ro, address, "get_lc_state", [lc_id]),
-        "get_protocol_summary": read(c_ro, address, "get_protocol_summary"),
+        "get_evidence_sources": read(c_ro, address, "get_evidence_sources", [lc_id]),
         "verify_solvency_invariant": read(c_ro, address, "verify_solvency_invariant"),
     }
     rec["balances_after_wei"] = {
@@ -434,7 +509,7 @@ def main() -> int:
         "contract": balance(c_ro, address),
     }
 
-    # ---- 7. deployed bytes == repository bytes ------------------------------------
+    # ---- 8. deployed bytes == repository bytes ---------------------------------------
     try:
         res = subprocess.run(["genlayer", "code", address], capture_output=True, text=True, timeout=180).stdout
         body = res.split("Result:\n", 1)[1] if "Result:\n" in res else res

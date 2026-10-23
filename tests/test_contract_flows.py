@@ -13,21 +13,22 @@ from conftest import (
     CARGO_HASH,
     CONTAINER,
     CONTRACT,
+    IMO,
     LATEST,
     MAX_TEMP,
     NOT_FOUND,
     PRINCIPAL,
     ROOT,
-    SHA,
     T0,
+    WITNESSES,
     assert_reverts,
+    binding_of,
     feed_urls,
     hex_of,
     ok,
     record,
 )
 
-H = "44" * 32
 HOUR = 3600
 ACCEPT_DEADLINE = T0 + 48 * HOUR
 GRACE = 7 * 86400
@@ -35,11 +36,11 @@ SETTLEMENT_WINDOW = 30 * 86400
 
 
 def _departed(**kw):
-    return ok(record(manifest_hash=H, status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0, **kw))
+    return ok(record(status="VESSEL_DEPARTED", arrival_ts=0, peak_temp_tenths_c=0, **kw))
 
 
 def _cleared(peak=MAX_TEMP - 5, **kw):
-    return ok(record(manifest_hash=H, peak_temp_tenths_c=peak, **kw))
+    return ok(record(peak_temp_tenths_c=peak, **kw))
 
 
 def _stage1(world):
@@ -89,22 +90,34 @@ def test_summary_tracks_the_protocol(world):
     assert s["lc_state_counts"] == {"ACTIVE": 1}
     assert s["stage_1_bps"] == 2000 and s["stage_2_bps"] == 8000
     assert s["bucket_table_bps"] == [[8000, 0], [6000, 2000], [4000, 4000], [0, 8000]]
-    assert s["feed_hosts"] == ["raw.githubusercontent.com", "cdn.jsdelivr.net", "raw.githack.com"]
+    assert s["witness_pubkeys"] == [w.pub_hex for w in WITNESSES]
+    assert s["witness_roles"] == ["CARRIER_MANIFEST_WITNESS", "PORT_CUSTOMS_WITNESS", "COLD_CHAIN_AIS_WITNESS"]
+    assert s["evidence_schema"] == "cargoclear.evidence.v2"
 
 
-def test_get_feed_sources_lists_three_distinct_pinned_operators(world):
+def test_get_evidence_sources_lists_three_distinct_keyed_witnesses(world):
     world.open()
-    fs = world.contract.get_feed_sources("LC-1")
-    assert fs["commit_sha"] == SHA
-    assert fs["repository"] == "https://github.com/moltaphet/CargoClear"
+    fs = world.contract.get_evidence_sources("LC-1")
+    assert fs["vessel_imo"] == IMO and fs["evidence_binding"] == ""  # no BoL yet -> no binding
     hosts = [s["host"] for s in fs["sources"]]
     assert len(set(hosts)) == 3
     assert [s["url"] for s in fs["sources"]] == list(feed_urls())
-    assert [s["role"] for s in fs["sources"]] == ["CARRIER_MANIFEST_FEED", "PORT_CUSTOMS_FEED", "COLD_CHAIN_AIS_MIRROR"]
+    assert [s["role"] for s in fs["sources"]] == ["CARRIER_MANIFEST_WITNESS", "PORT_CUSTOMS_WITNESS", "COLD_CHAIN_AIS_WITNESS"]
+    assert [s["witness_pubkey"] for s in fs["sources"]] == [w.pub_hex for w in WITNESSES]
+    assert len({s["witness_pubkey"] for s in fs["sources"]}) == 3
+
+
+def test_binding_is_published_once_the_bol_is_verified(world):
+    world.ready()
+    expect = binding_of()
+    assert world.contract.get_evidence_sources("LC-1")["evidence_binding"] == expect
+    assert world.state()["evidence_binding"] == expect
+    assert world.contract.get_evidence_binding(BOL, CONTAINER, IMO) == expect
+    assert_reverts("ERR_INVALID_PARAMS", world.contract.get_evidence_binding, BOL, CONTAINER, "9074720")
 
 
 def test_unknown_views_revert(world):
-    for fn in (world.contract.get_lc_state, world.contract.get_feed_sources):
+    for fn in (world.contract.get_lc_state, world.contract.get_evidence_sources):
         assert_reverts("ERR_UNKNOWN_LC", fn, "LC-1")
         assert_reverts("ERR_UNKNOWN_LC", fn, "")
         assert_reverts("ERR_UNKNOWN_LC", fn, "lc-1")
@@ -127,6 +140,13 @@ BAD_OPEN = {
     "container_pipe": dict(container_id="MSKU|123"),
     "container_long": dict(container_id="M" * 65),
     "container_space": dict(container_id="MSKU 123"),
+    "imo_empty": dict(vessel_imo=""),
+    "imo_short": dict(vessel_imo="907472"),
+    "imo_long": dict(vessel_imo="90747290"),
+    "imo_bad_check_digit": dict(vessel_imo="9074720"),
+    "imo_letters": dict(vessel_imo="IMO90747"),
+    "imo_prefixed": dict(vessel_imo="IMO9074729"),
+    "imo_with_space": dict(vessel_imo="907 4729"),
     "cargo_hash_short": dict(cargo_spec_hash="ab" * 31),
     "cargo_hash_upper": dict(cargo_spec_hash="AB" * 32),
     "cargo_hash_nonhex": dict(cargo_spec_hash="zz" * 32),
@@ -142,11 +162,15 @@ BAD_OPEN = {
 def test_open_rejects_bad_parameters(world, name):
     over = dict(BAD_OPEN[name])
     principal = over.pop("principal", PRINCIPAL)
-    code = "ERR_PRINCIPAL_REQUIRED" if name in ("zero_value", "dust_value") else "ERR_INVALID_PARAMS"
+    code = "ERR_INVALID_PARAMS"
+    if name in ("zero_value", "dust_value"):
+        code = "ERR_PRINCIPAL_REQUIRED"
+    elif name.startswith("imo_"):
+        code = "ERR_INVALID_VESSEL_IMO"
     world.as_(world.importer)
     world.vm.value = principal
     args = dict(
-        exporter=hex_of(world.exporter), container_id=CONTAINER, cargo_spec_hash=CARGO_HASH,
+        exporter=hex_of(world.exporter), container_id=CONTAINER, vessel_imo=IMO, cargo_spec_hash=CARGO_HASH,
         max_temp_tenths_c=MAX_TEMP, latest_arrival_ts=LATEST,
         feed_a_url=feed_urls()[0], feed_b_url=feed_urls()[1], feed_c_url=feed_urls()[2],
     )
@@ -160,7 +184,7 @@ def test_importer_cannot_be_their_own_exporter(world):
     world.vm.value = PRINCIPAL
     assert_reverts(
         "ERR_INVALID_PARAMS", world.contract.open_letter_of_credit,
-        exporter=hex_of(world.importer), container_id=CONTAINER, cargo_spec_hash=CARGO_HASH,
+        exporter=hex_of(world.importer), container_id=CONTAINER, vessel_imo=IMO, cargo_spec_hash=CARGO_HASH,
         max_temp_tenths_c=MAX_TEMP, latest_arrival_ts=LATEST,
         feed_a_url=feed_urls()[0], feed_b_url=feed_urls()[1], feed_c_url=feed_urls()[2],
     )
@@ -177,6 +201,7 @@ def test_open_records_terms_and_escrows_the_principal(world):
     st = world.state()
     assert st["importer"] == hex_of(world.importer) and st["exporter"] == hex_of(world.exporter)
     assert st["container_id"] == CONTAINER and st["cargo_spec_hash"] == CARGO_HASH
+    assert st["vessel_imo"] == IMO
     assert st["total_deposited"] == st["unreleased_escrow"] == PRINCIPAL
     assert st["accept_deadline"] == ACCEPT_DEADLINE == st["created_at"] + 48 * HOUR
     assert world.contract_balance() == PRINCIPAL
@@ -189,99 +214,105 @@ def test_lc_ids_are_sequential_and_independent(world):
     assert inv["total_deposited"] == 9000 and inv["solvent"]
 
 
-# ============================================================ feed pinning
+# ====================================================== witness endpoints
 GOOD = list(feed_urls())
-SHA2 = "b" * 40
 
 
 def _bad_urls():
     a, b, c = GOOD
     yield "http_scheme", 0, a.replace("https", "http")
-    yield "wrong_host_a", 0, b
-    yield "wrong_host_b", 1, a
-    yield "wrong_host_c", 2, b
-    yield "lookalike_host", 0, a.replace("raw.githubusercontent.com", "raw.githubusercontent.com.evil.io")
+    yield "no_scheme", 0, a[len("https://"):]
     yield "userinfo", 0, a.replace("https://", "https://user@")
-    yield "port", 0, a.replace(".com/", ".com:8443/")
+    yield "port", 0, a.replace(".net/", ".net:8443/")
     yield "query", 0, a + "?x=1"
     yield "fragment", 0, a + "#frag"
-    yield "wrong_owner_a", 0, a.replace("/moltaphet/", "/mallory/")
-    yield "wrong_repo_a", 0, a.replace("/CargoClear/", "/Other/")
-    yield "wrong_owner_b", 1, b.replace("/moltaphet/", "/mallory/")
-    yield "wrong_repo_c", 2, c.replace("/CargoClear/", "/Other/")
-    yield "branch_not_sha_a", 0, a.replace(SHA, "main")
-    yield "branch_not_sha_b", 1, b.replace(SHA, "main")
-    yield "short_sha", 0, a.replace(SHA, "a" * 39)
-    yield "long_sha_path", 0, a.replace(SHA, "a" * 41)
-    yield "upper_sha", 0, a.replace(SHA, "A" * 40)
-    yield "nonhex_sha", 0, a.replace(SHA, "g" * 40)
-    yield "wrong_folder_a", 0, a.replace("/a/", "/b/")
-    yield "wrong_folder_b", 1, b.replace("/b/", "/a/")
-    yield "wrong_folder_c", 2, c.replace("/c/", "/a/")
-    yield "traversal", 0, a.replace("/a/LC-1.json", "/a/../a/LC-1.json")
-    yield "double_slash", 0, a.replace("/a/LC-1", "/a//LC-1")
-    yield "percent_encoding", 0, a.replace("LC-1", "LC%2d1")
-    yield "backslash", 0, a.replace("/a/LC-1", "\\a\\LC-1")
-    yield "not_json", 0, a.replace("LC-1.json", "LC-1.txt")
-    yield "name_too_long", 0, a.replace("LC-1.json", "x" * 70 + ".json")
-    yield "name_bad_char", 0, a.replace("LC-1.json", "LC 1.json")
-    yield "name_too_short", 0, a.replace("LC-1.json", ".json")
-    yield "jsdelivr_npm_route", 1, b.replace("/gh/moltaphet/CargoClear@", "/npm/moltaphet/CargoClear@")
-    yield "jsdelivr_at_missing", 1, b.replace("@", "/")
+    yield "ipv4_literal", 0, "https://203.0.113.7/v1/evidence/X1"
+    yield "ipv6_literal", 0, "https://[2001:db8::1]/v1/evidence/X1"
+    yield "single_label_host", 0, "https://localhost/v1/evidence/X1"
+    yield "uppercase_host", 0, a.replace("carrier-witness", "Carrier-Witness")
+    yield "underscore_host", 1, b.replace("customs-witness", "customs_witness")
+    yield "leading_hyphen_label", 1, b.replace("customs-witness", "-customs")
+    yield "trailing_dot_host", 2, c.replace(".com/", ".com./")
+    yield "empty_label", 2, c.replace("ais-witness.example", "ais-witness..example")
+    yield "idn_host", 0, a.replace("carrier-witness", "cärrier")
+    yield "host_only", 0, "https://carrier-witness.example.net"
+    yield "host_trailing_slash_only", 0, "https://carrier-witness.example.net/"
+    yield "traversal", 0, a.replace("/v1/", "/v1/../v1/")
+    yield "double_slash", 0, a.replace("/v1/evidence", "/v1//evidence")
+    yield "percent_encoding", 0, a.replace("evidence", "evid%65nce")
+    yield "backslash", 0, a.replace("/v1/evidence", "\\v1\\evidence")
+    yield "space_in_path", 0, a.replace("evidence", "evi dence")
     yield "empty", 0, ""
-    yield "too_long", 0, a + "x" * 400
+    yield "too_long", 0, a + "x" * 1100
+    # a git repository behind a CDN is one publisher, not a witness
+    yield "raw_github_mirror", 0, f"https://raw.githubusercontent.com/moltaphet/CargoClear/{'a' * 40}/x/LC-1.json"
+    yield "jsdelivr_mirror", 1, f"https://cdn.jsdelivr.net/gh/moltaphet/CargoClear@{'a' * 40}/x/LC-1.json"
+    yield "githack_mirror", 2, f"https://raw.githack.com/moltaphet/CargoClear/{'a' * 40}/x/LC-1.json"
+    yield "github_pages", 0, "https://moltaphet.github.io/CargoClear/evidence/X1"
+    yield "gitlab_pages", 1, "https://moltaphet.gitlab.io/cargoclear/evidence/X1"
+    yield "mirror_subdomain", 0, "https://a.b.githubusercontent.com/evidence/X1"
 
 
 BAD_URLS = list(_bad_urls())
 
 
-@pytest.mark.parametrize("name,idx,url", BAD_URLS, ids=[b[0] for b in BAD_URLS])
-def test_feed_url_pinning_rejects(world, name, idx, url):
-    urls = list(GOOD)
-    urls[idx] = url
+def _open_raw(world, urls, **over):
     world.as_(world.importer)
     world.vm.value = PRINCIPAL
-    assert_reverts(
-        "ERR_INVALID_FEED_URL", world.contract.open_letter_of_credit,
-        exporter=hex_of(world.exporter), container_id=CONTAINER, cargo_spec_hash=CARGO_HASH,
+    args = dict(
+        exporter=hex_of(world.exporter), container_id=CONTAINER, vessel_imo=IMO, cargo_spec_hash=CARGO_HASH,
         max_temp_tenths_c=MAX_TEMP, latest_arrival_ts=LATEST,
         feed_a_url=urls[0], feed_b_url=urls[1], feed_c_url=urls[2],
     )
+    args.update(over)
+    return world.contract.open_letter_of_credit(**args)
 
 
-def test_all_three_feeds_must_pin_the_same_commit(world):
-    a, b, c = GOOD
-    world.as_(world.importer)
-    world.vm.value = PRINCIPAL
-    assert_reverts(
-        "ERR_INVALID_FEED_URL", world.contract.open_letter_of_credit,
-        exporter=hex_of(world.exporter), container_id=CONTAINER, cargo_spec_hash=CARGO_HASH,
-        max_temp_tenths_c=MAX_TEMP, latest_arrival_ts=LATEST,
-        feed_a_url=a, feed_b_url=b.replace(SHA, SHA2), feed_c_url=c,
-    )
+@pytest.mark.parametrize("name,idx,url", BAD_URLS, ids=[b[0] for b in BAD_URLS])
+def test_witness_endpoint_rules_reject(world, name, idx, url):
+    urls = list(GOOD)
+    urls[idx] = url
+    assert_reverts("ERR_INVALID_FEED_URL", _open_raw, world, urls)
+    assert world.contract.get_protocol_summary()["lc_count"] == 0
 
 
-def test_same_host_cannot_serve_two_feeds(world):
-    a = GOOD[0]
-    world.as_(world.importer)
-    world.vm.value = PRINCIPAL
-    assert_reverts(
-        "ERR_INVALID_FEED_URL", world.contract.open_letter_of_credit,
-        exporter=hex_of(world.exporter), container_id=CONTAINER, cargo_spec_hash=CARGO_HASH,
-        max_temp_tenths_c=MAX_TEMP, latest_arrival_ts=LATEST,
-        feed_a_url=a, feed_b_url=a.replace("/a/", "/b/"), feed_c_url=GOOD[2],
-    )
+@pytest.mark.parametrize("pair", [(0, 1), (0, 2), (1, 2)])
+def test_one_host_cannot_serve_two_witness_slots(world, pair):
+    """Three slots on one host would be one transport path, one outage domain."""
+    urls = list(GOOD)
+    urls[pair[1]] = urls[pair[0]].replace("/evidence/", "/other/")
+    assert_reverts("ERR_INVALID_FEED_URL", _open_raw, world, urls)
 
 
-def test_validate_feed_url_returns_the_sha(cc):
-    for i, url in enumerate(GOOD):
-        assert cc.validate_feed_url(i, url) == SHA
+def test_distinct_hosts_on_one_domain_are_accepted(world):
+    """Distinct hostnames are the contract's transport rule; operator independence
+    is carried by the witness KEYS (see test_evidence_auth)."""
+    urls = [f"https://{n}.shared-platform.example/v1/evidence/{CONTAINER}" for n in ("w1", "w2", "w3")]
+    assert _open_raw(world, urls) == "LC-1"
 
 
-@pytest.mark.parametrize("name", ["LC-1.json", "a_b.c-d.json", "X" * 59 + ".json", "shipment.2026.json"])
-def test_file_names_that_are_allowed(cc, name):
-    for i, url in enumerate(GOOD):
-        assert cc.validate_feed_url(i, url.replace("LC-1.json", name)) == SHA
+def test_witness_urls_are_not_pinned_to_any_repository(world):
+    urls = [f"https://{n}.{d}/anything/at/all/{CONTAINER}" for n, d in (("a", "one.example"), ("b", "two.example"), ("c", "three.example"))]
+    assert _open_raw(world, urls) == "LC-1"
+    assert [s["url"] for s in world.contract.get_evidence_sources("LC-1")["sources"]] == urls
+
+
+def test_validate_evidence_urls_returns_the_hosts(cc):
+    assert cc.validate_evidence_urls(GOOD) == [
+        "carrier-witness.example.net",
+        "customs-witness.example.org",
+        "ais-witness.example.com",
+    ]
+
+
+@pytest.mark.parametrize("name", ["LC-1.json", "a_b.c-d", "X" * 59, "shipment.2026.json", "MSKU1234567"])
+def test_path_tails_that_are_allowed(cc, name):
+    urls = [u.rsplit("/", 1)[0] + "/" + name for u in GOOD]
+    assert cc.validate_evidence_urls(urls) == [
+        "carrier-witness.example.net",
+        "customs-witness.example.org",
+        "ais-witness.example.com",
+    ]
 
 
 # ======================================================= 48h exporter handshake
@@ -427,7 +458,7 @@ def test_a_settled_lc_cannot_be_replayed_with_flipped_feeds(world):
     world.ready()
     _stage1(world)
     _stage2(world)  # clean -> exporter gets everything
-    rej = ok(record(manifest_hash=H, status="CUSTOMS_REJECTED"))
+    rej = ok(record(status="CUSTOMS_REJECTED"))
     world.mock_feeds(rej, rej, rej)
     world.as_(world.importer)
     assert_reverts("ERR_INVALID_STATE", world.contract.settle_shipment_stage, "LC-1", 2)
@@ -449,7 +480,7 @@ def test_exporter_can_trigger_settlement_too(world):
 
 def test_stage1_departure_after_deadline_does_not_unlock(world):
     world.ready()
-    late = ok(record(manifest_hash=H, status="VESSEL_DEPARTED", departure_ts=LATEST + 1, arrival_ts=0, peak_temp_tenths_c=0, event_ts=T0 - 10))
+    late = ok(record(status="VESSEL_DEPARTED", departure_ts=LATEST + 1, arrival_ts=0, peak_temp_tenths_c=0, event_ts=T0 - 10))
     world.mock_feeds(late, late, late)
     out = world.settle(1)
     assert out["verdict"] == 2 and out["source_count"] == 0
@@ -458,14 +489,14 @@ def test_stage1_departure_after_deadline_does_not_unlock(world):
 
 def test_stage1_departure_exactly_at_deadline_unlocks(world):
     world.ready()
-    edge = ok(record(manifest_hash=H, status="VESSEL_DEPARTED", departure_ts=T0 - 10, arrival_ts=0, peak_temp_tenths_c=0))
+    edge = ok(record(status="VESSEL_DEPARTED", departure_ts=T0 - 10, arrival_ts=0, peak_temp_tenths_c=0))
     world.mock_feeds(edge, edge, edge)
     assert world.settle(1)["verdict"] == 1
 
 
 def test_stage1_zero_departure_does_not_unlock(world):
     world.ready()
-    z = ok(record(manifest_hash=H, status="VESSEL_DEPARTED", departure_ts=0, arrival_ts=0, peak_temp_tenths_c=0))
+    z = ok(record(status="VESSEL_DEPARTED", departure_ts=0, arrival_ts=0, peak_temp_tenths_c=0))
     world.mock_feeds(z, z, z)
     assert world.settle(1)["verdict"] == 2
 
@@ -473,7 +504,7 @@ def test_stage1_zero_departure_does_not_unlock(world):
 @pytest.mark.parametrize("status", ["VESSEL_DEPARTED", "CUSTOMS_CLEARED", "CUSTOMS_REJECTED"])
 def test_stage1_accepts_any_record_proving_departure(world, status):
     world.ready()
-    r = ok(record(manifest_hash=H, status=status))
+    r = ok(record(status=status))
     world.mock_feeds(r, r, NOT_FOUND)
     assert world.settle(1)["verdict"] == 1
 
@@ -490,14 +521,14 @@ def test_stage2_with_vessel_still_at_sea_is_lag_not_failure_of_cargo(world):
 
 def test_records_for_a_different_shipment_are_ignored(world):
     world.ready()
-    other = ok(record(manifest_hash=H, status="VESSEL_DEPARTED", container_id="MSKU9999999"))
+    other = ok(record(status="VESSEL_DEPARTED", container_id="MSKU9999999"))
     world.mock_feeds(other, other, other)
     assert world.settle(1)["verdict"] == 2
 
 
 def test_voyage_aborted_before_departure_refunds_everything(world):
     world.ready()
-    ab = ok(record(manifest_hash=H, status="VOYAGE_ABORTED"))
+    ab = ok(record(status="VOYAGE_ABORTED"))
     world.mock_feeds(ab, ab, NOT_FOUND)
     out = world.settle(1)
     assert out["verdict"] == 0 and out["bucket"] == 3
@@ -512,7 +543,7 @@ def test_voyage_aborted_before_departure_refunds_everything(world):
 def test_customs_rejection_after_departure_refunds_stage2_only(world):
     world.ready()
     _stage1(world)
-    rej = ok(record(manifest_hash=H, status="CUSTOMS_REJECTED"))
+    rej = ok(record(status="CUSTOMS_REJECTED"))
     world.mock_feeds(rej, rej, NOT_FOUND)
     out = world.settle(2)
     assert out["verdict"] == 0 and out["bucket"] == 3 and out["source_count"] == 2
@@ -524,7 +555,7 @@ def test_customs_rejection_after_departure_refunds_stage2_only(world):
 def test_single_rejection_never_confiscates(world):
     world.ready()
     _stage1(world)
-    rej = ok(record(manifest_hash=H, status="CUSTOMS_REJECTED"))
+    rej = ok(record(status="CUSTOMS_REJECTED"))
     world.mock_feeds(rej, NOT_FOUND, NOT_FOUND)
     assert world.settle(2)["verdict"] == 2
     assert world.state()["importer_rebate"] == 0
@@ -702,24 +733,25 @@ def test_only_open_letter_of_credit_is_payable():
     assert payable == ["open_letter_of_credit"]
 
 
-def test_malicious_manifest_hash_cannot_split_the_quorum(world):
-    """An attacker-controlled source reporting a different manifest cannot move
-    money: positives must agree on the manifest hash as well as the bucket."""
+def test_a_witness_signing_for_another_shipment_cannot_split_or_join_the_quorum(world):
+    """Validly signed evidence bound to a DIFFERENT bill of lading is not evidence
+    about this container: it is an outage, so it can neither add to nor split quorum."""
     world.ready()
     _stage1(world)
-    a = ok(record(manifest_hash=H, peak_temp_tenths_c=MAX_TEMP - 5))
-    b = ok(record(manifest_hash="55" * 32, peak_temp_tenths_c=MAX_TEMP - 5))
-    c = ok(record(manifest_hash="66" * 32, peak_temp_tenths_c=MAX_TEMP - 5))
+    a = ok(record(peak_temp_tenths_c=MAX_TEMP - 5))
+    b = ok(record(peak_temp_tenths_c=MAX_TEMP - 5, bol_record_id="BOL-OTHER", binding=binding_of("BOL-OTHER")))
+    c = ok(record(peak_temp_tenths_c=MAX_TEMP - 5, bol_record_id="BOL-OTHER", binding=binding_of("BOL-OTHER")))
     world.mock_feeds(a, b, c)
-    assert world.settle(2)["verdict"] == 2
+    out = world.settle(2)
+    assert out["verdict"] == 2 and out["source_count"] == 1
 
 
 def test_two_colluding_sources_are_outvoted_only_when_they_disagree_with_each_other(world):
     world.ready()
     _stage1(world)
-    honest = ok(record(manifest_hash=H, peak_temp_tenths_c=MAX_TEMP - 5))
-    lie1 = ok(record(manifest_hash=H, peak_temp_tenths_c=MAX_TEMP + 25))
-    lie2 = ok(record(manifest_hash=H, peak_temp_tenths_c=MAX_TEMP + 25))
+    honest = ok(record(peak_temp_tenths_c=MAX_TEMP - 5))
+    lie1 = ok(record(peak_temp_tenths_c=MAX_TEMP + 25))
+    lie2 = ok(record(peak_temp_tenths_c=MAX_TEMP + 25))
     world.mock_feeds(honest, lie1, lie2)
     out = world.settle(2)
     assert out["bucket"] == 2 and out["source_count"] == 2  # 2-of-3 is the trust assumption
@@ -774,7 +806,7 @@ def test_contract_exposes_exactly_the_documented_surface():
         "verify_bill_of_lading", "settle_shipment_stage", "reclaim_expired_lc", "claim_funds",
     }
     assert {
-        "get_lc_state", "get_protocol_summary", "get_feed_sources", "verify_solvency_invariant",
+        "get_lc_state", "get_protocol_summary", "get_evidence_sources", "get_evidence_binding", "check_evidence", "verify_solvency_invariant",
         "get_bol_message", "check_bol_attestation", "preview_settlement", "preview_bucket",
     } == views
     # there is deliberately no admin, no pause, no upgrade, no fee-taking path
@@ -788,7 +820,7 @@ class _Resp:
         self.__dict__.update(kw)
 
 
-GOOD_BODY = json.dumps(record(manifest_hash=H)).encode()
+GOOD_BODY = json.dumps(record()).encode()
 
 
 @pytest.mark.parametrize(
@@ -880,7 +912,7 @@ def test_summary_counters_track_every_transition(world):
     world.contract.accept_lc_terms("LC-4")
     world.contract.accept_lc_terms("LC-6")
     world.verify_bol("LC-6", "BOL-6")
-    ab = ok(record(manifest_hash=H, status="VOYAGE_ABORTED", bol_record_id="BOL-6", lc_id="LC-6"))
+    ab = ok(record(status="VOYAGE_ABORTED", bol_record_id="BOL-6", binding=binding_of("BOL-6")))
     world.mock_feeds(ab, ab, ab)
     world.as_(world.importer)
     assert json.loads(world.contract.settle_shipment_stage("LC-6", 1))["verdict"] == 0
@@ -938,18 +970,32 @@ MUTATIONS = [
     ("sig_hash_reduce", "% _L\n    # [S]B - [k]A must equal R", "% (_L - 1)\n    # [S]B - [k]A must equal R"),
     ("sig_scalar_unchecked", "    if s >= _L:\n        return False\n", ""),
     ("bol_check_removed", "        if not self._check_bol(lc, bol_record_id, attestation_signature):", "        if False:"),
-    ("bol_message_drops_container", "            container_id,\n            exporter_address,", "            exporter_address,"),
+    ("bol_message_drops_container", "            container_id,\n            vessel_imo,\n            exporter_address,", "            vessel_imo,\n            exporter_address,"),
+    ("bol_message_drops_imo", "            vessel_imo,\n            exporter_address,", "            exporter_address,"),
+    ("imo_check_digit_skipped", "    return total % 10 == int(imo[6])", "    return True"),
     ("bol_replay_allowed", "        if bol_record_id in self.bol_registry:", "        if False:"),
-    ("bol_not_required", "        if not lc.bol_verified:\n            raise _err(ERR_BOL_NOT_VERIFIED", "        if False:\n            raise _err(ERR_BOL_NOT_VERIFIED"),
-    ("pubkey_small_order_allowed", "        if pt is None or _is_small_order(pt):", "        if pt is None:"),
+    ("bol_not_required", "        if not lc.bol_verified:\n            raise _err(ERR_BOL_NOT_VERIFIED, \"verify the bill of lading first\")\n        if stage == STAGE_1_DEPARTURE:", "        if False:\n            raise _err(ERR_BOL_NOT_VERIFIED, \"verify the bill of lading first\")\n        if stage == STAGE_1_DEPARTURE:"),
+    ("pubkey_small_order_allowed", "            if pt is None or _is_small_order(pt):", "            if pt is None:"),
+    ("witness_keys_not_distinct", "        if len(set(keys)) != 4:", "        if False:"),
     # --- quorum
-    ("reject_needs_one", "        if len(grp) >= 2:\n            return {\n                \"verdict\": VERDICT_REJECTION", "        if len(grp) >= 1:\n            return {\n                \"verdict\": VERDICT_REJECTION"),
-    ("positive_needs_one", "        if len(grp) >= 2:\n            return {\n                \"verdict\": VERDICT_VERIFIED", "        if len(grp) >= 1:\n            return {\n                \"verdict\": VERDICT_VERIFIED"),
+    ("reject_needs_one", "        if len(signers) >= 2:\n            return {\n                \"verdict\": VERDICT_REJECTION", "        if len(signers) >= 1:\n            return {\n                \"verdict\": VERDICT_REJECTION"),
+    ("positive_needs_one", "        if len(signers) >= 2:\n            return {\n                \"verdict\": VERDICT_VERIFIED", "        if len(signers) >= 1:\n            return {\n                \"verdict\": VERDICT_VERIFIED"),
+    ("reject_signers_not_distinct", "        if len(signers) >= 2:\n            return {\n                \"verdict\": VERDICT_REJECTION", "        if len(grp) >= 2:\n            return {\n                \"verdict\": VERDICT_REJECTION"),
+    ("positive_signers_not_distinct", "        if len(signers) >= 2:\n            return {\n                \"verdict\": VERDICT_VERIFIED", "        if len(grp) >= 2:\n            return {\n                \"verdict\": VERDICT_VERIFIED"),
+    ("evidence_signature_unchecked", "    return ed25519_verify(bytes.fromhex(witness_hex), msg, sig)", "    return True"),
+    ("evidence_wrong_slot_key", "    witness_hex = terms[\"witness_pubkeys\"][slot]\n    sig = bytes.fromhex", "    witness_hex = terms[\"witness_pubkeys\"][0]\n    sig = bytes.fromhex"),
+    ("evidence_binding_unchecked", "        or rec[\"binding\"] != terms[\"binding\"]\n", ""),
+    ("evidence_imo_unchecked", "        or rec[\"vessel_imo\"] != terms[\"vessel_imo\"]\n", ""),
+    ("evidence_role_unchecked", "    if rec[\"role\"] != WITNESS_ROLES[slot]:\n        return False", "    if False:\n        return False"),
+    ("evidence_message_drops_binding", "            rec[\"binding\"],\n            rec[\"bol_record_id\"],\n            rec[\"container_id\"],\n            rec[\"vessel_imo\"],", "            rec[\"bol_record_id\"],\n            rec[\"container_id\"],\n            rec[\"vessel_imo\"],"),
+    ("evidence_message_drops_status", "            rec[\"status\"],\n            str(rec[\"departure_ts\"]),", "            str(rec[\"departure_ts\"]),"),
+    ("evidence_message_drops_temperature", "            str(rec[\"event_ts\"]),\n            str(rec[\"peak_temp_tenths_c\"]),", "            str(rec[\"event_ts\"]),"),
     ("validator_ignores_fields", "        if leader_payload[key] != own_payload[key]:", "        if False:"),
     ("future_skew_off_by_one", "if rec[\"event_ts\"] > horizon or", "if rec[\"event_ts\"] >= horizon or"),
     ("float_literals_allowed", "            parse_float=_reject_float,\n", ""),
     ("duplicate_keys_allowed", "            object_pairs_hook=_reject_pairs,\n", ""),
-    ("manifest_hash_ignored", "            key = (o[\"stage\"], o[\"bucket\"], o[\"manifest_hash\"])", "            key = (o[\"stage\"], o[\"bucket\"], \"\")"),
+    ("positive_binding_ignored", "            groups_pos.setdefault((o[\"stage\"], o[\"bucket\"], o[\"binding\"]), []).append(o)", "            groups_pos.setdefault((o[\"stage\"], o[\"bucket\"], \"\"), []).append(o)"),
+    ("reject_binding_ignored", "            groups_rej.setdefault((o[\"stage\"], o[\"bucket\"], o[\"binding\"]), []).append(o)", "            groups_rej.setdefault((o[\"stage\"], o[\"bucket\"], \"\"), []).append(o)"),
     ("ids_not_matched", "        rec[\"bol_record_id\"] != terms[\"bol_record_id\"]\n        or ", "        False\n        or "),
     ("departure_deadline_ignored", "rec[\"departure_ts\"] > 0 and rec[\"departure_ts\"] <= latest", "rec[\"departure_ts\"] > 0"),
     # --- handshake and authorization
@@ -958,7 +1004,9 @@ MUTATIONS = [
     ("cancel_window_off_by_one", "            if _now_ts() <= int(lc.accept_deadline):", "            if _now_ts() < int(lc.accept_deadline):"),
     ("acceptance_window_length", "ACCEPTANCE_WINDOW = 48 * 3600", "ACCEPTANCE_WINDOW = 24 * 3600"),
     ("cancel_by_anyone", "            raise _err(ERR_UNAUTHORIZED, \"only the importer may cancel\")", "            pass"),
-    ("same_commit_not_enforced", "        if sha_a != sha_b or sha_b != sha_c:", "        if False:"),
+    ("witness_hosts_not_distinct", "    if len(set(hosts)) != 3:", "    if False:"),
+    ("git_mirrors_allowed", "            if host == banned or host.endswith(\".\" + banned):", "            if False:"),
+    ("http_allowed", "    if not url.startswith(\"https://\"):", "    if False:"),
     ("self_dealing_allowed", "        if exporter_addr == importer_addr:", "        if False:"),
     ("stage_order_ignored", "            if lc.state != ST_STAGE_1 or not lc.stage1_settled or lc.stage2_settled:", "            if lc.stage2_settled:"),
     ("double_stage1", "            if lc.state != ST_ACTIVE or lc.stage1_settled:", "            if lc.state != ST_ACTIVE:"),

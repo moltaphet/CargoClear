@@ -25,13 +25,14 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 ATTO = 10**18
 PRINCIPAL = 1_000_000_000_000_000_003  # deliberately not divisible by 5 -> exercises dust
-SHA = "a" * 40
 T0 = 1_792_000_000  # 2026-10-14T..Z, the "now" of every test
 LATEST = T0 + 7 * 86400
 MAX_TEMP = -180
 CARGO_HASH = hashlib.sha256(b"frozen shrimp, grade A").hexdigest()
 CONTAINER = "MSKU1234567"
 BOL = "BOL-CC-0001"
+IMO = "9074729"  # 9*7 + 0*6 + 7*5 + 4*4 + 7*3 + 2*2 = 139 -> check digit 9
+WITNESS_ROLES = ("CARRIER_MANIFEST_WITNESS", "PORT_CUSTOMS_WITNESS", "COLD_CHAIN_AIS_WITNESS")
 
 
 def iso(ts: int) -> str:
@@ -40,11 +41,36 @@ def iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def feed_urls(sha: str = SHA, name: str = "LC-1.json"):
+def feed_urls(container: str = CONTAINER):
+    """Three witness endpoints on three distinct hosts (names only; the web is mocked)."""
     return (
-        f"https://raw.githubusercontent.com/moltaphet/CargoClear/{sha}/deployments/mock_feeds/a/{name}",
-        f"https://cdn.jsdelivr.net/gh/moltaphet/CargoClear@{sha}/deployments/mock_feeds/b/{name}",
-        f"https://raw.githack.com/moltaphet/CargoClear/{sha}/deployments/mock_feeds/c/{name}",
+        f"https://carrier-witness.example.net/v1/evidence/{container}",
+        f"https://customs-witness.example.org/api/evidence/{container}",
+        f"https://ais-witness.example.com/evidence/{container}",
+    )
+
+
+def binding_of(bol: str = BOL, container: str = CONTAINER, imo: str = IMO) -> str:
+    """Independent re-statement of the shipment nonce (does not call the contract)."""
+    return hashlib.sha256(f"cargoclear.binding.v2|{bol}|{container}|{imo}".encode()).hexdigest()
+
+
+def evidence_message(rec: dict) -> str:
+    """Independent re-statement of the string a witness signs."""
+    return "|".join(
+        (
+            "cargoclear.evidence.v2",
+            rec["role"],
+            rec["binding"],
+            rec["bol_record_id"],
+            rec["container_id"],
+            rec["vessel_imo"],
+            rec["status"],
+            str(rec["departure_ts"]),
+            str(rec["arrival_ts"]),
+            str(rec["event_ts"]),
+            str(rec["peak_temp_tenths_c"]),
+        )
     )
 
 
@@ -60,24 +86,29 @@ def hex_of(a) -> str:
 
 
 def record(**over) -> dict:
+    """An evidence record body WITHOUT role/signature. `ok()` keeps the dict so
+    World.mock_feeds can have witness `slot` fill the role and sign it."""
     base = {
-        "schema": "cargoclear.feed.v1",
+        "schema": "cargoclear.evidence.v2",
+        "binding": binding_of(),
         "bol_record_id": BOL,
-        "lc_id": "LC-1",
         "container_id": CONTAINER,
+        "vessel_imo": IMO,
         "status": "CUSTOMS_CLEARED",
         "departure_ts": T0 - 6 * 86400,
         "arrival_ts": T0 - 86400,
         "peak_temp_tenths_c": -185,
-        "manifest_hash": hashlib.sha256(b"manifest-1").hexdigest(),
         "event_ts": T0 - 3600,
     }
     base.update(over)
     return base
 
 
-def ok(rec: dict) -> dict:
-    return {"status": 200, "body": json.dumps(rec)}
+def ok(rec: dict, signer=None) -> dict:
+    """A 200 response carrying `rec`. Unless the record already has a
+    `signature`, the witness of whichever slot serves it signs it (or `signer`
+    does, to model a validly-shaped record from a key nobody registered)."""
+    return {"status": 200, "body": json.dumps(rec), "_rec": rec, "_signer": signer}
 
 
 NOT_FOUND = {"status": 404, "body": "not found"}
@@ -107,7 +138,7 @@ def assert_reverts(code, fn, *args, **kwargs):
 
 
 class Carrier:
-    """Test double for the Maritime Carrier Authority (real Ed25519)."""
+    """Test double for an Ed25519 signer (the Carrier Authority, or a witness)."""
 
     def __init__(self, seed: bytes = b"carrier-authority-seed-000000001"):
         self.sk = Ed25519PrivateKey.from_private_bytes(seed)
@@ -118,9 +149,31 @@ class Carrier:
         return self.sk.sign(message.encode()).hex()
 
 
+def _witness_seed(i: int) -> bytes:
+    return (b"witness-%d-seed-" % i).ljust(32, b"0")
+
+
+WITNESSES = tuple(Carrier(_witness_seed(i)) for i in range(3))
+
+
+def sign_for_slot(rec: dict, slot: int, signer=None) -> dict:
+    """`rec` with the slot's role filled (unless set) and signed by the slot's
+    witness (or `signer`)."""
+    out = dict(rec)
+    out.setdefault("role", WITNESS_ROLES[slot])
+    who = signer or WITNESSES[slot]
+    out["signature"] = who.sign(evidence_message(out))
+    return out
+
+
 @pytest.fixture(scope="session")
 def carrier():
     return Carrier()
+
+
+@pytest.fixture(scope="session")
+def witnesses():
+    return WITNESSES
 
 
 @pytest.fixture(scope="session")
@@ -150,7 +203,7 @@ class World:
         self.now = T0
         self.vm.warp(iso(T0))
         self.vm.sender = self.importer
-        self.contract = deploy(str(CONTRACT), carrier.pub_hex)
+        self.contract = deploy(str(CONTRACT), carrier.pub_hex, *(w.pub_hex for w in WITNESSES))
         self.warp(T0)
         self.vm.deal(self.importer, 10 * ATTO)
         self.vm.deal(self.exporter, 0)
@@ -194,6 +247,7 @@ class World:
         args = dict(
             exporter=hex_of(self.exporter),
             container_id=CONTAINER,
+            vessel_imo=IMO,
             cargo_spec_hash=CARGO_HASH,
             max_temp_tenths_c=MAX_TEMP,
             latest_arrival_ts=LATEST,
@@ -235,10 +289,22 @@ class World:
         self.verify_bol()
 
     def mock_feeds(self, a=None, b=None, c=None):
+        """Mock the three witness endpoints. Responses built with `ok(rec)` are
+        signed by the witness serving that slot; anything else is served verbatim."""
         self.vm.clear_mocks()
-        for url, resp in zip(feed_urls(), (a, b, c)):
-            if resp is not None:
-                self.vm.mock_web(re.escape(url), resp)
+        for slot, (url, resp) in enumerate(zip(feed_urls(), (a, b, c))):
+            if resp is None:
+                continue
+            resp = dict(resp)
+            rec = resp.pop("_rec", None)
+            signer = resp.pop("_signer", None)
+            if rec is not None:
+                if "signature" not in rec:
+                    rec = sign_for_slot(rec, slot, signer)
+                elif "role" not in rec:
+                    rec = dict(rec, role=WITNESS_ROLES[slot])
+                resp["body"] = json.dumps(rec)
+            self.vm.mock_web(re.escape(url), resp)
 
     def settle(self, stage, who=None):
         self.as_(who or self.importer)
